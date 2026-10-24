@@ -1,0 +1,16 @@
+rate/s     cpu%         verdict  governor
+---------------------------------------------------------
+10         0.0267       PASS     passive
+50         0.0276       PASS     passive
+100        0.0337       PASS     sampling 1-in-2
+200        0.0381       PASS     sampling 1-in-2
+300        0.0343       PASS     sampling 1-in-2
+500        0.0348       PASS     sampling 1-in-5
+1000       0.0321       PASS     sampling 1-in-5
+2000       0.0322       PASS     sampling 1-in-8
+5000       0.0245       PASS     sampling 1-in-18
+10000      0.0285       PASS     sampling 1-in-12
+---------------------------------------------------------
+worst case across all rates: 0.0381%  ->  ALL UNDER 0.05%
+
+[exited with code 0]

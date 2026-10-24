@@ -1,0 +1,64 @@
+[Unit]
+Description=Wisp userspace EDR sensor
+Documentation=man:wispd(8) file:/usr/local/share/doc/wisp/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/wispd -c /etc/wisp/wisp.conf
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=3
+
+# The sensor runs as UID 0 confined to the capability bounding set below
+# (it is not a fully unprivileged process: FIM watches and quarantine need to
+# read and move files other users own). It loads a verified eBPF tracepoint
+# program (not a kernel module) and reads ancestor /proc entries.
+#   CAP_BPF, CAP_PERFMON - load + attach the exec tracepoint program
+#   CAP_SYS_PTRACE       - read /proc/<pid>/{comm,exe,root} for attribution and
+#                          to find a quarantined program in its own namespace
+#   CAP_KILL             - enforce (kill) response action
+#   CAP_DAC_READ_SEARCH  - FIM and inventory read files of every user
+#   CAP_DAC_OVERRIDE     - quarantine: remove a binary from a user-owned directory
+#   CAP_FOWNER           - quarantine: remove a binary from a sticky dir (/tmp)
+# (The connector fallback sensor needs CAP_NET_ADMIN instead of CAP_BPF/PERFMON.)
+AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_PTRACE CAP_KILL CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_FOWNER
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_PTRACE CAP_KILL CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_FOWNER CAP_NET_ADMIN
+NoNewPrivileges=yes
+
+# Resource guardrails: the sensor is tiny, so cap it hard. If it ever
+# misbehaves it can use at most ~2% of one CPU and 64 MB, never the host.
+CPUQuota=2%
+MemoryMax=64M
+TasksMax=16
+# Kernels before 5.11 charge BPF maps to RLIMIT_MEMLOCK (the exec ring buffer
+# alone is 4 MiB); without this the program fails to load with EPERM there.
+LimitMEMLOCK=infinity
+
+# Hardening. The OS (/usr, /boot, /etc) stays read-only, so not even a
+# compromised sensor can change system binaries or its own configuration.
+ProtectSystem=strict
+# systemd creates these on every start (an image cleanup that removed them
+# must not stop the sensor) and makes them writable.
+LogsDirectory=wisp
+LogsDirectoryMode=0750
+StateDirectory=wisp
+StateDirectoryMode=0750
+# Quarantine removes the offending binary from where it was run. A running
+# process's file is reached through /proc/<pid>/root (its own mount
+# namespace); one that already exited is reached through the sensor's view,
+# so the usual drop locations are writable for it and the host's real /tmp is
+# used ('-': a path that does not exist is skipped). If you point log_dir or
+# state_dir elsewhere, add that path here with a drop-in.
+ReadWritePaths=-/tmp -/var/tmp -/dev/shm -/run/user -/home -/root -/opt -/srv
+ProtectHome=no
+PrivateTmp=no
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

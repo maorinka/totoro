@@ -1,0 +1,25 @@
+# Wisp sensor logs. The sensor keeps its log files open with O_APPEND, so
+# copytruncate is safe: no lines are lost or interleaved at rotation.
+# telemetry.jsonl (one line per exec) is the large one; alerts and inventory
+# are kept longer because they are the audit record.
+/var/log/wisp/telemetry.jsonl {
+	daily
+	rotate 7
+	maxsize 200M
+	compress
+	delaycompress
+	missingok
+	notifempty
+	copytruncate
+}
+
+/var/log/wisp/alerts.jsonl /var/log/wisp/inventory.jsonl {
+	weekly
+	rotate 26
+	maxsize 100M
+	compress
+	delaycompress
+	missingok
+	notifempty
+	copytruncate
+}

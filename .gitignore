@@ -1,0 +1,31 @@
+# build artifacts
+agent/*.o
+agent/wispd
+console/wisp-console
+console/build/
+# generated BPF (regenerated from exec.bpf.c + kernel BTF at build time)
+agent/bpf/vmlinux.h
+agent/bpf/exec.bpf.o
+agent/bpf/exec.skel.h
+# demo state / keys
+pki/
+*.log
+
+# stray npm test artifacts
+node_modules/
+package-lock.json
+package.json
+# build stamp recording which sensor was built
+agent/.sensor-*
+
+# console runtime state -- never commit (the vault key decrypts every secret)
+vault.json
+vault.json.key
+*.vault.key
+events.jsonl*
+console/state/
+# release output
+dist/
+ui-shots/
+# python bytecode
+__pycache__/

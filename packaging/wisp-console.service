@@ -1,0 +1,70 @@
+[Unit]
+Description=Wisp fleet console
+Documentation=file:/usr/local/share/doc/wisp/docs/console.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Defaults; override in /etc/wisp/console.env (see docs/installation.md).
+#   WISP_INGEST   sensor ingest (mutual TLS), reachable by every sensor
+#   WISP_HTTP     web console + API; keep it on loopback behind your TLS
+#                 proxy, or serve HTTPS itself (below)
+#   WISP_EXTRA    further flags, e.g. -ai-key-file
+Environment=WISP_INGEST=:8750 WISP_HTTP=127.0.0.1:8080 WISP_EXTRA=
+EnvironmentFile=-/etc/wisp/console.env
+# Secrets are handed to the service as systemd credentials: readable only
+# by this unit's dynamic user, never copied into its state directory.
+#
+# The service runs as a dynamic user that can NOT read /etc/wisp/console, so
+# every file a flag names must be a credential, passed by its absolute path
+# under /run/credentials/wisp-console.service/ (console.env values are not
+# expanded: ${CREDENTIALS_DIRECTORY} there stays literal). For example:
+#   HTTPS with the ingest certificate below, in /etc/wisp/console.env:
+#     WISP_EXTRA=-http-cert /run/credentials/wisp-console.service/console.crt -http-key /run/credentials/wisp-console.service/console.key
+#   Any other secret file (a separate HTTPS certificate, the Claude API key,
+#   the vault key): add it in a drop-in (systemctl edit wisp-console)
+#     [Service]
+#     LoadCredential=anthropic.key:/etc/wisp/console/anthropic.key
+#     LoadCredential=vault.key:/etc/wisp/console/vault.key
+#     Environment=WISP_VAULT_KEY_FILE=/run/credentials/wisp-console.service/vault.key
+#   and pass -ai-key-file /run/credentials/wisp-console.service/anthropic.key
+#   in WISP_EXTRA.
+LoadCredential=console.crt:/etc/wisp/console/console.crt
+LoadCredential=console.key:/etc/wisp/console/console.key
+LoadCredential=sensor-ca.crt:/etc/wisp/console/sensor-ca.crt
+LoadCredential=roles.conf:/etc/wisp/console/roles.conf
+ExecStart=/usr/local/bin/wisp-console \
+  -listen ${WISP_INGEST} -http ${WISP_HTTP} \
+  -cert ${CREDENTIALS_DIRECTORY}/console.crt -key ${CREDENTIALS_DIRECTORY}/console.key \
+  -client-ca ${CREDENTIALS_DIRECTORY}/sensor-ca.crt \
+  -roles ${CREDENTIALS_DIRECTORY}/roles.conf \
+  -state-dir ${STATE_DIRECTORY} $WISP_EXTRA
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+
+DynamicUser=yes
+StateDirectory=wisp-console
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+LimitNOFILE=65536
+# Each sensor connection holds a thread: keep this above -max-sensors.
+TasksMax=20480
+
+[Install]
+WantedBy=multi-user.target

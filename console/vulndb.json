@@ -1,0 +1,9 @@
+[
+  {"ecosystem":"npm","name":"event-stream","affected":["3.3.6"],"fixed":"4.0.1","cve":"CVE-2018-16487","severity":"critical","cvss":9.8,"note":"flatmap-stream backdoor"},
+  {"ecosystem":"npm","name":"lodash","affectedBelow":"4.17.21","cve":"CVE-2021-23337","severity":"high","cvss":7.2,"note":"command injection via template"},
+  {"ecosystem":"npm","name":"minimist","affectedBelow":"1.2.6","cve":"CVE-2021-44906","severity":"critical","cvss":9.8,"note":"prototype pollution"},
+  {"ecosystem":"npm","name":"ws","affectedBelow":"7.4.6","cve":"CVE-2021-32640","severity":"medium","cvss":5.3,"note":"ReDoS"},
+  {"ecosystem":"pip","name":"requests","affectedBelow":"2.31.0","cve":"CVE-2023-32681","severity":"medium","cvss":6.1,"note":"proxy auth leak"},
+  {"ecosystem":"pip","name":"pyyaml","affectedBelow":"5.4","cve":"CVE-2020-14343","severity":"critical","cvss":9.8,"note":"arbitrary code via full_load"},
+  {"ecosystem":"pip","name":"ctx","affected":["0.1.2"],"cve":"PVE-2022-doubt","severity":"critical","cvss":9.1,"note":"malicious takeover"}
+]

@@ -1,0 +1,55 @@
+name: ci
+
+on:
+  push:
+    branches: [main, production, cpp-console]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: build + unit tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libbpf-dev libelf-dev zlib1g-dev libssl-dev \
+            g++ nlohmann-json3-dev linux-tools-common "linux-tools-$(uname -r)" shellcheck
+      - name: Build sensor and console
+        run: make
+      - name: Unit tests (ASan/UBSan, TSan), policy and UI checks
+        run: make test
+      - name: Shell scripts
+        run: shellcheck -S warning packaging/install.sh bench/mkpki.sh demo.sh
+      - name: Connector fallback sensor builds
+        run: make -C agent clean && SENSOR=connector make -C agent && make -C agent clean && make -C agent
+      - name: Release tarball
+        run: make dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wisp-dist
+          path: dist/*.tar.gz*
+
+  integration:
+    name: integration (root, eBPF)
+    runs-on: ubuntu-24.04
+    needs: build-and-test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libbpf-dev libelf-dev zlib1g-dev libssl-dev \
+            g++ nlohmann-json3-dev linux-tools-common "linux-tools-$(uname -r)" mingw-w64
+      - name: Full verification suite
+        # Detection, enforcement, CPU budget, rate limiting, anomalies,
+        # forensics, console lifecycle/rollouts, MDM install. CPU figures on
+        # shared CI runners are noisier than on a dedicated host.
+        run: make verify
