@@ -88,10 +88,15 @@
   const TRUST = { tpm: 'TPM-backed', dmi: 'Platform (DMI)', 'machine-id': 'Machine ID', generated: 'Generated' };
 
   // ---- auth + API ----------------------------------------------------------
+  // Web storage can throw (site data blocked by policy): fall back to memory
+  // so the user can still sign in for the lifetime of the tab.
+  let memToken = '';
   const store = {
-    get token() { return sessionStorage.getItem('wisp.token') || localStorage.getItem('wisp.token') || ''; },
-    setToken(t, remember) { (remember ? localStorage : sessionStorage).setItem('wisp.token', t); },
-    clearToken() { sessionStorage.removeItem('wisp.token'); localStorage.removeItem('wisp.token'); },
+    get token() {
+      try { return sessionStorage.getItem('wisp.token') || localStorage.getItem('wisp.token') || memToken; } catch { return memToken; }
+    },
+    setToken(t, remember) { memToken = t; try { (remember ? localStorage : sessionStorage).setItem('wisp.token', t); } catch { /* memory only */ } },
+    clearToken() { memToken = ''; try { sessionStorage.removeItem('wisp.token'); localStorage.removeItem('wisp.token'); } catch { /* memory only */ } },
     pref(k, d) { try { return localStorage.getItem('wisp.' + k) ?? d; } catch { return d; } },
     setPref(k, v) { try { localStorage.setItem('wisp.' + k, v); } catch { /* private mode */ } },
   };
@@ -141,10 +146,20 @@
     else b.hidden = true;
     paintLive();
   }
+  // The visible "Updated 1m ago" text is not a live region (it would be
+  // re-announced every few seconds); only state changes are announced.
+  let liveState = '';
   function paintLive() {
     const el = $('#live');
     el.className = 'live' + (paused ? ' paused' : connDown ? ' down' : '');
-    clear(el).append(h('span', { text: paused ? 'Paused' : connDown ? 'Offline' : lastOk ? `Updated ${rel(new Date(lastOk).toISOString())}` : 'Live' }));
+    const text = paused ? 'Paused' : connDown ? 'Offline' : lastOk ? `Updated ${rel(new Date(lastOk).toISOString())}` : 'Live';
+    if (el.textContent !== text) clear(el).append(h('span', { text }));
+    const st = paused ? 'Auto-refresh paused' : connDown ? 'Offline: the console is unreachable' : 'Live';
+    if (st !== liveState) {
+      const announce = liveState !== '';
+      liveState = st;
+      if (announce) $('#live-sr').textContent = st;
+    }
   }
   let toastTimer;
   function toast(msg, err) {
@@ -159,29 +174,48 @@
     hide() { $('#tip').hidden = true; } };
 
   // ---- drawer + confirm (focus-managed dialogs) ----------------------------
-  let drawerReturn = null;
-  function openDrawer(title, build) {
-    drawerReturn = document.activeElement;
+  // Every openDrawer() call builds into its own fresh container, so a slow
+  // build from a drawer the user already left only ever writes into a
+  // detached node. `key` names what the drawer shows (e.g. "incident:INC-1").
+  let drawerReturn = null, drawerKey = '', drawerBody = null;
+  const drawerOpen = () => !$('#drawer').hidden;
+  const drawerShows = (key) => drawerOpen() && drawerKey === key;
+  function openDrawer(title, build, key = '') {
+    if (!drawerOpen()) drawerReturn = document.activeElement;
+    drawerKey = key;
     $('#drawer-title').textContent = title;
-    const body = clear($('#drawer-body'));
+    const body = drawerBody = h('div', { class: 'drawer-content' }, h('div', { class: 'loading', text: 'Loading…' }));
+    clear($('#drawer-body')).append(body);
     $('#drawer').hidden = false;
-    body.append(h('div', { class: 'loading', text: 'Loading…' }));
-    Promise.resolve(build(body)).catch((e) => { clear(body).append(errorBox(e)); });
+    // live(): this build's drawer is still the one on screen.
+    const live = () => drawerBody === body && drawerOpen();
+    Promise.resolve(build(body, live)).catch((e) => { clear(body).append(errorBox(e)); });
     $('#drawer-close').focus();
   }
-  function closeDrawer() {
+  function closeDrawer(restoreFocus = true) {
+    if (!drawerOpen()) return;
     $('#drawer').hidden = true;
-    if (drawerReturn && drawerReturn.focus) drawerReturn.focus();
+    drawerKey = ''; drawerBody = null;
+    let back = drawerReturn; drawerReturn = null;
+    if (!restoreFocus) return;
+    // The row that opened the drawer may have been rebuilt meanwhile.
+    if (back && !back.isConnected && back.dataset && back.dataset.key) back = $('#main').querySelector(`[data-key="${CSS.escape(back.dataset.key)}"]`);
+    if (back && back.isConnected && back.focus && back !== document.body) back.focus();
+    else $('#main').focus();
   }
+  const FOCUSABLE = 'a[href],button:not([disabled]),input,select,textarea,summary,[tabindex]:not([tabindex="-1"])';
   function trapFocus(container, ev) {
     if (ev.key !== 'Tab') return;
-    const f = [...container.querySelectorAll('a[href],button:not([disabled]),input,select,textarea,[tabindex]:not([tabindex="-1"])')].filter((x) => x.offsetParent !== null);
+    const f = [...container.querySelectorAll(FOCUSABLE)].filter((x) => x.offsetParent !== null);
     if (!f.length) return;
     const first = f[0], last = f[f.length - 1];
-    if (ev.shiftKey && document.activeElement === first) { last.focus(); ev.preventDefault(); }
+    if (!container.contains(document.activeElement)) { (ev.shiftKey ? last : first).focus(); ev.preventDefault(); }
+    else if (ev.shiftKey && document.activeElement === first) { last.focus(); ev.preventDefault(); }
     else if (!ev.shiftKey && document.activeElement === last) { first.focus(); ev.preventDefault(); }
   }
+  let confirmCancel = null;
   function confirmDialog(title, bodyNodes, yesLabel = 'Confirm', danger = false) {
+    if (confirmCancel) confirmCancel();
     return new Promise((resolve) => {
       const m = $('#confirm'), prev = document.activeElement;
       $('#confirm-title').textContent = title;
@@ -189,9 +223,13 @@
       const yes = $('#confirm-yes'), no = $('#confirm-no');
       yes.textContent = yesLabel; yes.className = 'btn ' + (danger ? 'danger' : 'primary');
       m.hidden = false; no.focus();
-      const done = (v) => { m.hidden = true; yes.onclick = no.onclick = m.onkeydown = null; if (prev && prev.focus) prev.focus(); resolve(v); };
+      const done = (v, restore = true) => {
+        m.hidden = true; yes.onclick = no.onclick = null; confirmCancel = null;
+        if (restore && prev && prev.isConnected && prev.focus) prev.focus();
+        resolve(v);
+      };
       yes.onclick = () => done(true); no.onclick = () => done(false);
-      m.onkeydown = (e) => { if (e.key === 'Escape') done(false); trapFocus(m, e); };
+      confirmCancel = (restore = true) => done(false, restore);
     });
   }
 
@@ -200,25 +238,37 @@
     return h('div', { class: 'empty' }, h('b', { text: 'Could not load this view' }), e.message || String(e));
   }
   function empty(title, text) { return h('div', { class: 'empty' }, h('b', { text: title }), text || ''); }
-  function table(cols, rows, { onRow, rowLabel, emptyNode, page = 0 } = {}) {
+  // Rows with onRow carry data-key so the refresh loop can put keyboard focus
+  // back on the same row after a rebuild. `state` (an object the page keeps
+  // across refreshes) remembers how many pages the user has revealed.
+  const defaultKey = (r) => r.id ?? r.name ?? r.rule ?? r.host;
+  function table(cols, rows, { onRow, rowLabel, rowKey = defaultKey, emptyNode, page = 0, state } = {}) {
     if (!rows.length) return h('div', { class: 'tablewrap' }, emptyNode || empty('Nothing to show'));
     if (page && rows.length > page) {
       // Render a page at a time so long lists stay fast and scannable.
       const wrap = h('div', {});
-      let shown = page;
-      const draw = () => {
+      const st = state || {};
+      let shown = Math.max(page, st.shown || 0);
+      const draw = (focusFrom) => {
         const more = rows.length - shown;
-        clear(wrap).append(table(cols, rows.slice(0, shown), { onRow, rowLabel, emptyNode }),
+        clear(wrap).append(table(cols, rows.slice(0, shown), { onRow, rowLabel, rowKey, emptyNode }),
           more > 0 ? h('div', { class: 'row', style: { justifyContent: 'center', marginTop: '12px' } },
-            h('button', { class: 'btn', type: 'button', onclick: () => { shown += page; draw(); } }, `Show ${Math.min(page, more)} more`),
+            h('button', { class: 'btn', type: 'button', dataset: { more: '1' }, onclick: () => { const from = shown; shown += page; st.shown = shown; draw(from); } }, `Show ${Math.min(page, more)} more`),
             h('span', { class: 'muted', text: `${fmtNum(shown)} of ${fmtNum(rows.length)}` })) : null);
+        if (focusFrom != null) {
+          // Keep keyboard users in place: focus the first newly shown row.
+          const tr = wrap.querySelectorAll('tbody tr')[focusFrom];
+          const target = tr && tr.tabIndex >= 0 ? tr : wrap.querySelector('[data-more]');
+          if (target) target.focus({ preventScroll: true });
+        }
       };
       draw();
       return wrap;
     }
     const thead = h('thead', {}, h('tr', {}, cols.map((c) => h('th', { scope: 'col', class: c.num ? 'num' : '' }, c.label))));
     const tbody = h('tbody', {}, rows.map((r) => {
-      const tr = h('tr', onRow ? { class: 'clickable', tabindex: '0', 'aria-label': rowLabel ? rowLabel(r) : null } : {},
+      const key = onRow ? rowKey(r) : null;
+      const tr = h('tr', onRow ? { class: 'clickable', tabindex: '0', 'aria-label': rowLabel ? rowLabel(r) : null, dataset: key != null ? { key: 'row:' + key } : null } : {},
         cols.map((c) => h('td', { class: c.num ? 'num' : c.cls || '' }, c.cell(r))));
       if (onRow) {
         tr.addEventListener('click', () => onRow(r, tr));
@@ -244,12 +294,21 @@
     el.value = value;
     return el;
   }
+  // Active filters that have no control of their own (deep links such as
+  // ?rule= or ?host=) are shown as removable chips.
+  function filterChips(items, onRemove) {
+    const shown = items.filter(([, , v]) => v);
+    if (!shown.length) return null;
+    return h('div', { class: 'chips active-filters', role: 'group', 'aria-label': 'Active filters' }, shown.map(([k, label, v]) =>
+      h('span', { class: 'chip' }, `${label}: `, h('b', { text: v }),
+        h('button', { class: 'chip-x', type: 'button', 'aria-label': `Remove the ${label.toLowerCase()} filter`, title: 'Remove filter', onclick: () => onRemove(k) }, icon('i-close', 'ic small')))));
+  }
   const debounce = (fn, ms = 250) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
 
   // Column chart: one series, columns <= 24px with a 4px rounded data end and
   // a square baseline, hairline grid, a hover tooltip per column, and a table
   // view for screen readers / exact values.
-  function columnChart(data, { height = 160, label = '', unit = '' } = {}) {
+  function columnChart(data, { height = 160, label = '', unit = '', key = '' } = {}) {
     const W = 640, H = height, padL = 30, padB = 22, padT = 10;
     const max = Math.max(1, ...data.map((d) => d.value));
     const step = niceStep(max);
@@ -271,11 +330,13 @@
       hit.addEventListener('mouseenter', (ev) => { path && path.classList.add('hot'); tip.show(ev, [h('b', { text: `${fmtNum(d.value)}${unit}` }), h('div', { class: 'muted', text: d.tip || d.label })]); });
       hit.addEventListener('mousemove', (ev) => tip.move(ev));
       hit.addEventListener('mouseleave', () => { path && path.classList.remove('hot'); tip.hide(); });
-      svg.append(hit);
+      // The hit area goes on top of the column so hovering the column itself
+      // shows the tooltip (the bar has pointer-events: none as well).
       if (path) svg.append(path);
+      svg.append(hit);
       if (d.tick) svg.append(s('text', { class: 'tick', x: padL + i * band + band / 2, y: H - 6, 'text-anchor': 'middle', text: d.tick }));
     });
-    const tv = h('details', { class: 'table-view' }, h('summary', { text: 'Show as table' }),
+    const tv = h('details', { class: 'table-view', dataset: key ? { key: 'details:' + key } : null }, h('summary', { text: 'Show as table' }),
       table([{ label: 'Period', cell: (d) => d.tip || d.label }, { label: 'Count', num: true, cell: (d) => fmtNum(d.value) }], data));
     return h('div', { class: 'chart' }, svg, tv);
   }
@@ -327,7 +388,7 @@
         const act = (status, label) => h('button', { class: 'btn small' + (status === 'resolved' ? ' primary' : ''), type: 'button', disabled: a.status === status, onclick: async () => {
           try {
             const upd = await api('/api/alerts/triage', { method: 'POST', body: { id: a.id, status, note: note.value } });
-            toast({ acknowledged: 'Alert acknowledged', resolved: 'Alert resolved', open: 'Alert reopened' }[status]); Object.assign(a, upd); onChange && onChange(); alertDrawer(a, onChange);
+            toast({ acknowledged: 'Alert acknowledged', resolved: 'Alert resolved', open: 'Alert reopened' }[status]); Object.assign(a, upd); onChange && onChange(); if (drawerShows('alert:' + a.id)) alertDrawer(a, onChange);
           } catch (e) { toast(e.message, true); }
         } }, label);
         tri.append(note, h('div', { class: 'row', style: { marginTop: '8px' } }, act('acknowledged', 'Acknowledge'), act('resolved', 'Resolve'), act('open', 'Reopen')));
@@ -341,12 +402,13 @@
           h('a', { class: 'btn small', href: `/alerts${qs({ host: a.host, status: 'all' })}` }, 'All alerts on host')),
         a.pid ? h('p', { class: 'hint' }, 'Full process tree, including every exec and network flow, from the host itself: ', h('code', { text: `sudo wispd --search tree=${a.pid}` })) : null);
       body.append(inv);
-    });
+    }, 'alert:' + a.id);
   }
 
   async function hostDrawer(name) {
-    openDrawer(name, async (body) => {
+    openDrawer(name, async (body, live) => {
       const d = await api('/api/hosts/detail' + qs({ name }));
+      if (!live()) return;
       const hst = d.host;
       clear(body);
       body.append(h('div', { class: 'row' }, stateBadge(hst.state), modeBadge(hst.mode), hst.ephemeral ? h('span', { class: 'badge', text: 'Ephemeral' }) : null,
@@ -385,7 +447,7 @@
       body.append(h('div', {}, h('h3', { text: `Software inventory (${d.inventory.length})` }),
         table([{ label: 'Kind', cell: (e) => e.kind }, { label: 'Name', cell: (e) => h('code', { text: e.name }) }, { label: 'Version', cell: (e) => e.version || '–' }],
           d.inventory, { emptyNode: empty('No inventory reported yet') })));
-    });
+    }, 'host:' + name);
   }
 
   // ---- analysis: incidents, suggestions, AI ---------------------------------
@@ -393,14 +455,15 @@
   const prioChip = (p) => h('span', { class: `sev ${PRIO[p] || 'info'}`, title: 'Priority' }, icon(`i-sev-${PRIO[p] || 'info'}`), p || '–');
   const VERDICT = { malicious: 'critical', suspicious: 'medium', benign: 'info' };
   const verdictChip = (v) => h('span', { class: `sev ${VERDICT[v] || 'info'}` }, icon(`i-sev-${VERDICT[v] || 'info'}`), cap(v || 'unknown'));
-  const aiBadge = () => h('span', { class: 'badge ai', title: 'Proposed by the AI assistant' }, icon('i-spark', 'ic small'), 'AI');
+  const aiBadge = (text = 'AI') => h('span', { class: 'badge ai', title: 'Proposed by the AI assistant' }, icon('i-spark', 'ic small'), text);
   const KIND = { contain: 'Contain', rollout: 'Gradual enforcement', tune_rule: 'Rule tuning', enforce_rule: 'Rule hardening', close_stale: 'Housekeeping',
     patch: 'Patch', ai_push: 'Policy push', ai_rollout: 'Rollout', ai_triage: 'Triage', ai_manual: 'Manual step', ai_rule: 'Rule change' };
 
+  // Fetched fresh by every view that needs it (cheap); a failed fetch is
+  // reported for that view only and never cached.
   let aiStatus = null;
   async function getAiStatus() {
-    try { aiStatus = await api('/api/ai/status'); } catch { aiStatus = { enabled: false, reason: 'unavailable' }; }
-    return aiStatus;
+    try { aiStatus = await api('/api/ai/status'); return aiStatus; } catch { aiStatus = null; return { enabled: false, reason: 'Its status could not be checked; try again shortly.' }; }
   }
   // Start an AI job and wait for it (the console runs it in the background).
   async function runAiJob(kind, body, onProgress) {
@@ -414,19 +477,34 @@
     if (job.status === 'failed') throw new ApiError(job.error || 'The AI request failed', 0);
     return job;
   }
-  function aiButton(label, kind, body, after) {
+  // In-flight AI jobs by target, so a re-opened drawer shows the running job
+  // instead of offering to start the same one again.
+  const aiJobs = new Map();
+  function aiButton(label, kind, body, after, st = aiStatus) {
     if (!can('operator')) return h('p', { class: 'muted', text: 'Asking the AI assistant requires the operator role.' });
-    if (aiStatus && !aiStatus.enabled) return h('p', { class: 'muted' }, 'The AI assistant is off. ', aiStatus.reason || '');
+    if (st && !st.enabled) return h('p', { class: 'muted' }, 'The AI assistant is off. ', st.reason || '');
+    const key = kind + ':' + JSON.stringify(body);
     const status = h('span', { class: 'muted', role: 'status', 'aria-live': 'polite' });
-    const btn = h('button', { class: 'btn small', type: 'button', onclick: async () => {
-      btn.disabled = true;
-      try {
-        const job = await runAiJob(kind, body, (j, secs) => { status.textContent = `${j.status === 'queued' ? 'Queued' : 'Thinking'}… ${secs}s`; });
-        status.textContent = '';
-        toast('AI analysis ready');
-        after(job);
-      } catch (e) { status.textContent = ''; toast(e.message, true); btn.disabled = false; }
+    const btn = h('button', { class: 'btn small', type: 'button', onclick: () => {
+      if (aiJobs.has(key)) return;
+      const job = { progress: null, promise: null };
+      job.promise = runAiJob(kind, body, (j, secs) => job.progress && job.progress(j, secs))
+        .then((res) => { toast('AI analysis ready'); return res; }, (e) => { toast(e.message, true); throw e; })
+        .finally(() => aiJobs.delete(key));
+      aiJobs.set(key, job);
+      watch(job);
     } }, icon('i-spark'), label);
+    // Only the button that is still on screen (in an open drawer) redraws when
+    // the job ends; otherwise the toast is all the user sees.
+    const onScreen = () => btn.isConnected && (!btn.closest('#drawer') || drawerOpen());
+    const watch = (job) => {
+      btn.disabled = true;
+      status.textContent = 'Thinking…';
+      job.progress = (j, secs) => { if (btn.isConnected) status.textContent = `${j.status === 'queued' ? 'Queued' : 'Thinking'}… ${secs}s`; };
+      job.promise.then((res) => { if (onScreen()) { status.textContent = ''; after(res); } },
+        () => { status.textContent = ''; btn.disabled = false; });
+    };
+    if (aiJobs.has(key)) watch(aiJobs.get(key));
     return h('div', { class: 'row' }, btn, status);
   }
 
@@ -440,7 +518,9 @@
 
   async function decide(sg, approve, onDone) {
     const note = h('textarea', { 'aria-label': 'Note', placeholder: approve ? 'Note for the audit trail (optional)' : 'Why not? (optional, kept in the audit trail)' });
-    const body = [h('p', { text: describeAction(sg.action) })];
+    const body = [];
+    if (sg.source === 'ai') body.push(aiNotice());
+    body.push(h('p', { text: describeAction(sg.action) }));
     if (sg.action.type === 'manual') body.push(h('pre', { class: 'block', text: sg.action.instructions }));
     else if (approve) body.push(h('p', { class: 'muted', text: 'The console carries this out now and records it with your name.' }));
     body.push(note);
@@ -454,14 +534,22 @@
     } catch (e) { toast(e.message, true); }
   }
 
+  // Whether this user may decide a suggestion. The server is the authority:
+  // it reports the role each suggestion needs (and, when present, a ready
+  // per-user can_approve); the UI only mirrors that and the server re-checks.
+  const mayDecide = (sg) => (typeof sg.can_approve === 'boolean' ? sg.can_approve : !!sg.required_role && can(sg.required_role));
+  const aiNotice = () => h('p', { class: 'ai-notice', role: 'note' }, icon('i-spark', 'ic small'), h('b', { text: 'AI suggestion — review before approving.' }),
+    ' ', h('span', { text: 'Proposed by the AI assistant from fleet data; check the action and evidence yourself.' }));
   function suggestionCard(sg, onDone) {
-    const allowed = can(sg.required_role);
+    const allowed = mayDecide(sg);
+    const isAi = sg.source === 'ai';
     const ev = (sg.evidence || []).map((x) => x.startsWith('INC-')
       ? h('a', { href: '#', onclick: (e) => { e.preventDefault(); incidentDrawer(x, onDone); } }, 'incident')
       : x.startsWith('rule:') ? h('a', { href: '/analysis' }, x.slice(5)) : h('code', { text: x }));
-    return h('li', { class: 'sugg' },
-      h('div', { class: 'row' }, sevChip(sg.severity), h('b', { class: 'grow', text: sg.title }), sg.source === 'ai' ? aiBadge() : null,
+    return h('li', { class: 'sugg' + (isAi ? ' from-ai' : '') },
+      h('div', { class: 'row' }, sevChip(sg.severity), h('b', { class: 'grow', text: sg.title }), isAi ? aiBadge() : null,
         h('span', { class: 'badge', text: KIND[sg.kind] || sg.kind })),
+      isAi && sg.status === 'proposed' ? aiNotice() : null,
       h('p', { class: 'muted', text: sg.rationale }),
       h('div', { class: 'row' }, h('span', { class: 'action-desc', text: describeAction(sg.action) }),
         ev.length ? h('span', { class: 'muted' }, 'Evidence: ', ...ev.flatMap((x, i) => (i ? [', ', x] : [x]))) : null,
@@ -471,7 +559,7 @@
         ? h('div', { class: 'row', style: { marginTop: '8px' } },
           h('button', { class: 'btn small primary', type: 'button', disabled: !allowed, onclick: () => decide(sg, true, onDone) }, sg.action.type === 'manual' ? 'Accept' : 'Approve'),
           h('button', { class: 'btn small', type: 'button', disabled: !allowed, onclick: () => decide(sg, false, onDone) }, 'Reject'),
-          !allowed ? h('span', { class: 'muted', text: `Needs the ${sg.required_role} role.` }) : null)
+          !allowed ? h('span', { class: 'muted', text: sg.required_role ? `Needs the ${sg.required_role} role${isAi ? ' for AI suggestions' : ''}; you are signed in as ${me.role || 'unknown'}.` : 'Your role cannot decide this suggestion.' }) : null)
         : h('p', { class: 'muted' }, `${cap(sg.status)} by ${sg.decided_by || '–'} `, timeEl(sg.decided_at), sg.result ? [': ', h('span', { text: sg.result })] : ''));
   }
 
@@ -487,10 +575,13 @@
   }
 
   function incidentDrawer(id, onChange) {
-    openDrawer('Incident', async (body) => {
-      const [inc] = await Promise.all([api('/api/incidents/detail' + qs({ id })), aiStatus ? null : getAiStatus()]);
+    const key = 'incident:' + id;
+    openDrawer('Incident', async (body, live) => {
+      const [inc, st] = await Promise.all([api('/api/incidents/detail' + qs({ id })), getAiStatus()]);
+      if (!live()) return;
       $('#drawer-title').textContent = `${inc.priority} · ${inc.host}`;
-      const redraw = () => { onChange && onChange(); incidentDrawer(id, onChange); };
+      // Redraw only while this incident is still the drawer on screen.
+      const redraw = () => { onChange && onChange(); if (drawerShows(key)) incidentDrawer(id, onChange); };
       clear(body);
       body.append(h('div', { class: 'row' }, prioChip(inc.priority), h('span', { class: 'badge', text: `Score ${inc.score}` }), sevChip(inc.severity),
         h('span', { class: 'badge', text: cap(inc.status) }), inc.contained ? h('span', { class: 'badge enforce', text: 'Contained' }) : null));
@@ -503,7 +594,7 @@
 
       const aiBox = h('div', {}, h('h3', { text: 'AI triage' }));
       if (inc.ai) aiBox.append(aiTriageView(inc.ai));
-      aiBox.append(aiButton(inc.ai ? 'Triage again' : 'Ask AI to triage', 'triage', { incident: inc.id }, redraw));
+      aiBox.append(aiButton(inc.ai ? 'Triage again' : 'Ask AI to triage', 'triage', { incident: inc.id }, redraw, st));
       body.append(aiBox);
 
       if (inc.suggestions.length) body.append(h('div', {}, h('h3', { text: 'Suggested actions' }), h('ul', { class: 'list suggs' }, inc.suggestions.map((sg) => suggestionCard(sg, redraw)))));
@@ -528,19 +619,38 @@
         inc.alerts, { onRow: (a) => alertDrawer(a, redraw) }),
         h('div', { class: 'row', style: { marginTop: '8px' } }, h('a', { class: 'btn small', href: '#', onclick: (e) => { e.preventDefault(); hostDrawer(inc.host); } }, 'Host details'),
           h('a', { class: 'btn small', href: `/investigate${qs({ host: inc.host, since: inc.first_ts })}` }, 'Events from this point'))));
-    });
+    }, key);
   }
 
   // ---- pages ---------------------------------------------------------------
+  // Each page mounts into its own container (page.root) and every load()
+  // starts with begin(this): the returned check is false once the user has
+  // navigated away or a newer load of the page has started, and a stale
+  // response is then dropped instead of being drawn.
   const pages = {};
+  function begin(page) {
+    const t = page._tok = (page._tok || 0) + 1;
+    return () => current === page && page._tok === t;
+  }
+  const reloadIf = (page) => () => { if (current === page) refresh(); };
 
   pages.overview = {
     title: 'Overview',
     mount(main) { this.el = main; main.append(h('div', { class: 'loading', text: 'Loading fleet overview…' })); },
     async load() {
+      const ok = begin(this);
+      const INC_LIMIT = 500;
       const [sm, crit, incs, sugg, hl] = await Promise.all([api('/api/summary'), api('/api/alerts' + qs({ status: 'open', severity: 'high', limit: 8 })),
-        api('/api/incidents' + qs({ status: 'open', limit: 500 })), api('/api/suggestions'), api('/api/analysis/health')]);
-      const p12 = incs.filter((i) => i.priority === 'P1' || i.priority === 'P2');
+        api('/api/incidents' + qs({ status: 'open', limit: INC_LIMIT })), api('/api/suggestions'), api('/api/analysis/health')]);
+      if (!ok()) return;
+      // The list is capped; prefer server-side counts when the API has them.
+      const ic = sm.incidents_open || null;
+      const capped = !ic && incs.length >= INC_LIMIT;
+      const plus = capped ? '+' : '';
+      const nP1 = ic && ic.by_priority ? ic.by_priority.P1 || 0 : incs.filter((i) => i.priority === 'P1').length;
+      const nP2 = ic && ic.by_priority ? ic.by_priority.P2 || 0 : incs.filter((i) => i.priority === 'P2').length;
+      const nOpen = ic && ic.total != null ? ic.total : incs.length;
+      const p12 = nP1 + nP2;
       const main = clear(this.el);
       if (!sm.hosts.live && !sm.hosts.decommissioned) main.append(onboarding());
       const vulnHot = (sm.vulns_by_tier.exploited || 0) + (sm.vulns_by_tier.reachable || 0);
@@ -548,7 +658,8 @@
         href ? h('a', { class: 'value', href }, value) : h('div', { class: 'value' }, value),
         h('div', { class: 'sub' }, ...sub.filter((x) => x != null).map((x) => (x instanceof Node ? x : h('span', { text: x })))));
       main.append(h('div', { class: 'grid kpis' },
-        kpi('Open incidents', fmtNum(incs.length), '/incidents', h('span', {}, prioChip('P1'), ` ${incs.filter((i) => i.priority === 'P1').length}`), h('span', {}, prioChip('P2'), ` ${incs.filter((i) => i.priority === 'P2').length}`)),
+        kpi('Open incidents', fmtNum(nOpen) + plus, '/incidents', h('span', {}, prioChip('P1'), ` ${fmtNum(nP1)}${plus}`), h('span', {}, prioChip('P2'), ` ${fmtNum(nP2)}${plus}`),
+          capped ? `Counted from the ${fmtNum(INC_LIMIT)} highest-ranked` : null),
         kpi('Hosts', fmtNum(sm.hosts.live), '/hosts', `${sm.hosts.active} active`, `${sm.hosts.stale} stale`, sm.hosts.ephemeral ? `${sm.hosts.ephemeral} ephemeral` : null),
         kpi('Open alerts', fmtNum(sm.alerts.open_total), '/alerts', h('span', {}, sevChip('critical'), ` ${sm.alerts.open_by_severity.critical || 0}`), h('span', {}, sevChip('high'), ` ${sm.alerts.open_by_severity.high || 0}`)),
         kpi('Fleet posture', h('span', { class: 'row' }, gradeEl(sm.posture.grade), `${sm.posture.score}`), '/posture', 'Score out of 100'),
@@ -562,26 +673,30 @@
         h('div', { class: 'card' }, h('h2', {}, 'Top incidents', h('a', { href: '/incidents', text: 'All incidents' })),
           table([{ label: 'Priority', cell: (i) => prioChip(i.priority) }, { label: 'Incident', cls: 'title-cell', cell: (i) => [h('b', { text: i.host }), h('div', { class: 'muted', text: i.summary })] },
             { label: 'Last activity', cell: (i) => timeEl(i.last_ts) }],
-          incs.slice(0, 5), { onRow: (i) => incidentDrawer(i.id, () => this.load()), rowLabel: (i) => `${i.priority} incident on ${i.host}`, emptyNode: empty('No open incidents') }),
-          p12.length > 5 ? h('p', { class: 'hint', text: `${p12.length} open P1/P2 incidents in total.` }) : null),
+          incs.slice(0, 5), { onRow: (i) => incidentDrawer(i.id, reloadIf(this)), rowLabel: (i) => `${i.priority} incident on ${i.host}`, emptyNode: empty('No open incidents') }),
+          p12 > 5 ? h('p', { class: 'hint', text: `${fmtNum(p12)}${plus} open P1/P2 incidents in total.` }) : null),
         h('div', { class: 'card' }, h('h2', {}, 'Suggested next steps', h('a', { href: '/suggestions', text: `${sugg.length} waiting` })),
           h('div', { class: 'row', style: { marginBottom: '6px' } }, h('span', { class: 'muted', text: 'Fleet health:' }), h('a', { href: '/analysis', text: HL[hl.status] || hl.status }),
             hl.findings.length ? h('span', { class: 'muted', text: `· ${hl.findings.length} finding${hl.findings.length === 1 ? '' : 's'}` }) : null),
-          sugg.length ? h('ul', { class: 'list' }, sugg.slice(0, 5).map((sg) => h('li', {}, sevChip(sg.severity), h('div', { class: 'grow' }, h('b', { text: sg.title }), h('div', { class: 'muted', text: describeAction(sg.action) })), sg.source === 'ai' ? aiBadge() : null)))
+          sugg.length ? h('ul', { class: 'list' }, sugg.slice(0, 5).map((sg) => h('li', {}, sevChip(sg.severity), h('div', { class: 'grow' }, h('b', { text: sg.title }), h('div', { class: 'muted', text: describeAction(sg.action) })),
+            sg.source === 'ai' ? h('span', { title: 'AI suggestion — review before approving' }, aiBadge('AI suggestion')) : null)))
             : empty('Nothing waiting for approval'))));
       main.append(h('div', { class: 'spacer' }));
 
-      const now = new Date();
+      // The server buckets by age: bucket 23 is the last 60 minutes, bucket i
+      // covers (now - (24-i) h, now - (23-i) h]. Label the real windows.
+      const now = Date.now();
+      const hm = (t) => t.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
       const hourly = sm.alerts.hourly_24h.map((v, i) => {
-        const t = new Date(now - (23 - i) * 3600e3);
-        const hh = t.getHours();
-        return { value: v, label: `${hh}:00`, tick: i % 4 === 3 ? `${hh}:00` : '', tip: `${t.toLocaleDateString(undefined, { weekday: 'short' })} ${hh}:00–${hh}:59` };
+        const end = new Date(now - (23 - i) * 3600e3), start = new Date(end - 3600e3);
+        const range = `${start.toLocaleDateString(undefined, { weekday: 'short' })} ${hm(start)}–${hm(end)}`;
+        return { value: v, label: range, tick: i % 4 === 3 ? hm(end) : '', tip: range };
       });
       const top = sm.alerts.top_rules_24h;
       const maxTop = Math.max(1, ...top.map((r) => r.count));
       main.append(h('div', { class: 'grid two' },
         h('div', { class: 'card' }, h('h2', {}, 'Alerts per hour', h('span', { class: 'muted', text: `· ${fmtNum(sm.alerts.last_24h)} in the last 24 hours` })),
-          columnChart(hourly, { label: 'Alerts per hour over the last 24 hours' })),
+          columnChart(hourly, { label: 'Alerts per 60-minute window over the last 24 hours', key: 'hourly' })),
         h('div', { class: 'card' }, h('h2', {}, 'Top detections', h('span', { class: 'muted', text: '· 24 hours' })),
           top.length ? h('ul', { class: 'list' }, top.map((r) => h('li', {}, h('div', { class: 'grow' }, h('b', { text: r.rule }), h('div', { class: 'muted', text: r.title })),
             h('span', { class: 'barcell', 'aria-hidden': 'true' }, h('span', { style: { width: `${(r.count / maxTop) * 100}%` } })), h('span', { class: 'n', text: fmtNum(r.count) })))) : empty('No detections in the last 24 hours', 'Quiet is good.'))));
@@ -590,7 +705,7 @@
         h('div', { class: 'card' }, h('h2', {}, 'Open high-severity alerts', h('a', { href: '/alerts?severity=high&status=open', text: 'View all' })),
           table([{ label: 'Severity', cell: (a) => sevChip(a.severity) }, { label: 'Detection', cls: 'title-cell', cell: (a) => [h('b', { text: a.rule }), ' ', h('span', { class: 'muted', text: a.title })] },
             { label: 'Host', cell: (a) => a.host }, { label: 'When', cell: (a) => timeEl(a.ts) }],
-          crit, { onRow: (a) => alertDrawer(a, () => this.load()), rowLabel: (a) => `${a.severity} ${a.rule} on ${a.host}`, emptyNode: empty('No open high or critical alerts') })),
+          crit, { onRow: (a) => alertDrawer(a, reloadIf(this)), rowLabel: (a) => `${a.severity} ${a.rule} on ${a.host}`, emptyNode: empty('No open high or critical alerts') })),
         h('div', { class: 'card' }, h('h2', {}, 'Recent rollouts', h('a', { href: '/rollouts', text: 'Rollouts' })),
           sm.recent_rollouts.length ? h('ul', { class: 'list' }, sm.recent_rollouts.map((r) => h('li', {}, h('div', { class: 'grow' }, h('b', { text: `${cap(r.action)} · ${r.group || 'all groups'} · ${r.percent}%` }),
             h('div', { class: 'muted' }, `${r.delivered.length}/${r.cohort.length} delivered · by ${r.by || '–'} · `, timeEl(r.ts)))))) : empty('No rollouts yet'))));
@@ -608,23 +723,31 @@
     title: 'Alerts',
     mount(main, params) {
       this.f = { status: params.get('status') || 'open', severity: params.get('severity') || '', host: params.get('host') || '', actor: params.get('actor') || '', q: params.get('q') || '', rule: params.get('rule') || '' };
-      const sync = () => { history.replaceState(null, '', '/alerts' + qs(this.f)); this.load(); };
+      const sync = () => { this.tv = {}; history.replaceState(null, '', '/alerts' + qs(this.f)); paintChips(); refresh(); };
+      const chips = h('div', {});
+      const paintChips = () => clear(chips).append(filterChips([['rule', 'Rule', this.f.rule]], (k) => { this.f[k] = ''; sync(); }));
+      paintChips();
       const q = h('input', { id: 'alert-q', type: 'search', placeholder: 'Search rule, title, command, host…', value: this.f.q, oninput: debounce(() => { this.f.q = q.value; sync(); }) });
-      this.hostSel = select('alert-host', [['', 'All hosts']], this.f.host, (v) => { this.f.host = v; sync(); });
+      const hostSel = this.hostSel = select('alert-host', [['', 'All hosts'], ...(this.f.host ? [[this.f.host, this.f.host]] : [])], this.f.host, (v) => { this.f.host = v; sync(); });
       main.append(h('div', { class: 'filters' },
         h('div', { class: 'field search' }, h('label', { for: 'alert-q', text: 'Search' }), q),
         h('div', { class: 'field' }, h('label', { text: 'Status' }), seg([['open', 'Open'], ['acknowledged', 'Acknowledged'], ['resolved', 'Resolved'], ['all', 'All']], this.f.status, (v) => { this.f.status = v; sync(); }, 'Status')),
         h('div', { class: 'field' }, h('label', { for: 'alert-sev', text: 'Severity' }), select('alert-sev', [['', 'Any'], ['low', 'Low and above'], ['medium', 'Medium and above'], ['high', 'High and above'], ['critical', 'Critical only']], this.f.severity, (v) => { this.f.severity = v; sync(); })),
         h('div', { class: 'field' }, h('label', { for: 'alert-host', text: 'Host' }), this.hostSel),
-        h('div', { class: 'field' }, h('label', { for: 'alert-actor', text: 'Actor' }), select('alert-actor', [['', 'Anyone'], ['ai', 'AI agents'], ['human', 'Humans'], ['code', 'Code'], ['ci', 'CI'], ['service', 'Services'], ['console', 'Console']], this.f.actor, (v) => { this.f.actor = v; sync(); }))));
+        h('div', { class: 'field' }, h('label', { for: 'alert-actor', text: 'Actor' }), select('alert-actor', [['', 'Anyone'], ['ai', 'AI agents'], ['human', 'Humans'], ['code', 'Code'], ['ci', 'CI'], ['service', 'Services'], ['console', 'Console']], this.f.actor, (v) => { this.f.actor = v; sync(); }))), chips);
       this.meta = h('div', { class: 'result-meta' });
       this.out = h('div', {}, h('div', { class: 'loading', text: 'Loading alerts…' }));
       main.append(this.meta, this.out);
-      api('/api/hosts?state=all').then((hs) => { for (const x of hs) this.hostSel.append(h('option', { value: x.name, text: x.name })); this.hostSel.value = this.f.host; }).catch(() => {});
+      api('/api/hosts?state=all').then((hs) => {
+        for (const x of hs) if (x.name !== this.f.host) hostSel.append(h('option', { value: x.name, text: x.name }));
+        hostSel.value = this.f.host;
+      }).catch(() => {});
     },
     async load() {
+      const ok = begin(this);
       const f = { ...this.f, status: this.f.status === 'all' ? '' : this.f.status, limit: 500 };
       const rows = await api('/api/alerts' + qs(f));
+      if (!ok()) return;
       this.meta.textContent = rows.length >= 500 ? 'Showing the newest 500 matching alerts' : `${fmtNum(rows.length)} matching alert${rows.length === 1 ? '' : 's'}`;
       clear(this.out).append(table([
         { label: 'Severity', cell: (a) => sevChip(a.severity) },
@@ -635,7 +758,7 @@
         { label: 'Command', cell: (a) => h('div', { class: 'cmd', title: a.cmd || '', text: a.cmd || '–' }) },
         { label: 'Response', cell: (a) => a.action || '–' },
         { label: 'Status', cell: (a) => cap(a.status) },
-      ], rows, { page: 100, onRow: (a) => alertDrawer(a, () => this.load()), rowLabel: (a) => `${a.severity} ${a.rule} on ${a.host}`,
+      ], rows, { page: 100, state: this.tv, onRow: (a) => alertDrawer(a, reloadIf(this)), rowLabel: (a) => `${a.severity} ${a.rule} on ${a.host}`,
         emptyNode: empty(this.f.status === 'open' ? 'No open alerts match' : 'No alerts match', 'Adjust the filters, or check back later.') }));
     },
   };
@@ -644,17 +767,22 @@
     title: 'Incidents',
     mount(main, params) {
       this.f = { status: params.get('status') || '', priority: params.get('priority') || '', host: params.get('host') || '' };
-      const sync = () => { history.replaceState(null, '', '/incidents' + qs(this.f)); this.load(); };
+      const sync = () => { this.tv = {}; history.replaceState(null, '', '/incidents' + qs(this.f)); paintChips(); refresh(); };
+      const chips = h('div', {});
+      const paintChips = () => clear(chips).append(filterChips([['host', 'Host', this.f.host]], (k) => { this.f[k] = ''; sync(); }));
+      paintChips();
       main.append(h('p', { class: 'muted', style: { marginTop: 0 } }, 'Related alerts on a host (the same actor or process lineage, close in time) are correlated into one incident and ranked by what matters: severity, how many stages of an attack it shows, whether it spread, whether the host is exposed, and whether the sensor already stopped it.'));
       main.append(h('div', { class: 'filters' },
         h('div', { class: 'field' }, h('label', { text: 'Status' }), seg([['', 'Active'], ['open', 'Open'], ['acknowledged', 'Acknowledged'], ['resolved', 'Resolved'], ['all', 'All']], this.f.status, (v) => { this.f.status = v; sync(); }, 'Status')),
-        h('div', { class: 'field' }, h('label', { text: 'Priority' }), seg([['', 'Any'], ['P1', 'P1'], ['P2', 'P2'], ['P3', 'P3'], ['P4', 'P4']], this.f.priority, (v) => { this.f.priority = v; sync(); }, 'Priority'))));
+        h('div', { class: 'field' }, h('label', { text: 'Priority' }), seg([['', 'Any'], ['P1', 'P1'], ['P2', 'P2'], ['P3', 'P3'], ['P4', 'P4']], this.f.priority, (v) => { this.f.priority = v; sync(); }, 'Priority'))), chips);
       this.meta = h('div', { class: 'result-meta' });
       this.out = h('div', {}, h('div', { class: 'loading', text: 'Correlating alerts…' }));
       main.append(this.meta, this.out);
     },
     async load() {
+      const ok = begin(this);
       const rows = await api('/api/incidents' + qs({ ...this.f, limit: 500 }));
+      if (!ok()) return;
       this.meta.textContent = `${fmtNum(rows.length)} incident${rows.length === 1 ? '' : 's'}${rows.length >= 500 ? ' (first 500)' : ''}`;
       clear(this.out).append(table([
         { label: 'Priority', cell: (i) => prioChip(i.priority) },
@@ -665,7 +793,7 @@
         { label: 'AI', cell: (i) => (i.ai ? verdictChip(i.ai.verdict) : h('span', { class: 'muted', text: '–' })) },
         { label: 'Last activity', cell: (i) => timeEl(i.last_ts) },
         { label: 'Status', cell: (i) => [cap(i.status), i.contained ? h('div', { class: 'muted', text: 'contained' }) : null] },
-      ], rows, { page: 100, onRow: (i) => incidentDrawer(i.id, () => this.load()), rowLabel: (i) => `${i.priority} incident on ${i.host}`,
+      ], rows, { page: 100, state: this.tv, onRow: (i) => incidentDrawer(i.id, reloadIf(this)), rowLabel: (i) => `${i.priority} incident on ${i.host}`,
         emptyNode: empty(this.f.status === 'resolved' ? 'No resolved incidents' : 'No active incidents', 'Incidents appear when sensors report alerts.') }));
     },
   };
@@ -675,34 +803,37 @@
     mount(main, params) {
       this.view = params.get('view') || 'inbox';
       const runBtn = can('operator') ? h('button', { class: 'btn small', type: 'button', onclick: async () => {
-        try { const r = await api('/api/analysis/run', { method: 'POST' }); toast(r.proposed ? `${r.proposed} new suggestion${r.proposed === 1 ? '' : 's'}` : 'No new suggestions'); this.load(); }
+        try { const r = await api('/api/analysis/run', { method: 'POST' }); toast(r.proposed ? `${r.proposed} new suggestion${r.proposed === 1 ? '' : 's'}` : 'No new suggestions'); reloadIf(this)(); }
         catch (e) { toast(e.message, true); }
       } }, 'Analyze now') : null;
       main.append(h('p', { class: 'muted', style: { marginTop: 0 } }, 'We suggest, you approve, we solve. Wisp watches incidents, fleet health, rule noise and exploitable software and proposes concrete fixes. Nothing changes until someone with the right role approves; every decision is recorded with their name.'));
       main.append(h('div', { class: 'filters' }, h('div', { class: 'field' }, h('label', { text: 'Show' }),
-        seg([['inbox', 'Waiting for approval'], ['history', 'Decided']], this.view, (v) => { this.view = v; history.replaceState(null, '', '/suggestions' + qs({ view: v })); this.load(); }, 'Show')),
+        seg([['inbox', 'Waiting for approval'], ['history', 'Decided']], this.view, (v) => { this.view = v; this.tv = {}; history.replaceState(null, '', '/suggestions' + qs({ view: v })); refresh(); }, 'Show')),
         h('div', { class: 'field', style: { marginLeft: 'auto', alignSelf: 'flex-end' } }, runBtn)));
       this.out = h('div', {}, h('div', { class: 'loading', text: 'Loading suggestions…' }));
       main.append(this.out);
     },
     async load() {
+      const ok = begin(this);
       if (this.view === 'inbox') {
         const rows = await api('/api/suggestions');
+        if (!ok()) return;
         const order = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
         rows.sort((a, b) => (order[a.severity] ?? 5) - (order[b.severity] ?? 5));
-        clear(this.out).append(rows.length ? h('ul', { class: 'list suggs card' }, rows.map((sg) => suggestionCard(sg, () => this.load())))
+        clear(this.out).append(rows.length ? h('ul', { class: 'list suggs card' }, rows.map((sg) => suggestionCard(sg, reloadIf(this))))
           : h('div', { class: 'card' }, empty('Nothing waiting for approval', 'The analysis runs every minute; new suggestions appear here.')));
         return;
       }
       const rows = (await api('/api/suggestions?status=all')).filter((x) => x.status !== 'proposed');
+      if (!ok()) return;
       clear(this.out).append(table([
         { label: 'Decided', cell: (x) => timeEl(x.decided_at) },
         { label: 'Suggestion', cls: 'title-cell', cell: (x) => [h('b', { text: x.title }), h('div', { class: 'muted', text: describeAction(x.action) })] },
-        { label: 'Source', cell: (x) => (x.source === 'ai' ? aiBadge() : h('span', { class: 'badge', text: 'Analysis' })) },
+        { label: 'Source', cell: (x) => (x.source === 'ai' ? aiBadge('AI suggestion') : h('span', { class: 'badge', text: 'Analysis' })) },
         { label: 'Outcome', cell: (x) => h('span', { class: 'badge ' + (x.status === 'applied' || x.status === 'accepted' ? 'enforce' : ''), text: cap(x.status) }) },
         { label: 'By', cell: (x) => x.decided_by || '–' },
         { label: 'Result', cell: (x) => h('div', { class: 'cmd', title: x.result || '', text: x.result || '–' }) },
-      ], rows, { page: 100, emptyNode: empty('No decisions yet') }));
+      ], rows, { page: 100, state: this.tv, emptyNode: empty('No decisions yet') }));
     },
   };
 
@@ -718,8 +849,10 @@
       this.drawAi();
     },
     async drawAi() {
+      const card = this.ai;
       const st = await getAiStatus();
-      const card = clear(this.ai);
+      if (!card.isConnected) return;
+      clear(card);
       card.append(h('h2', {}, 'Ask about your fleet', aiBadge()));
       if (!st.enabled) { card.append(h('p', { class: 'muted' }, 'The AI assistant is off. ', st.reason || ''), h('p', { class: 'hint', text: 'Incidents, suggestions and rule review work without it.' })); return; }
       card.append(h('p', { class: 'muted', style: { marginTop: 0 }, text: `Answers come from the console's own data through read-only tools. Secrets are redacted before anything leaves the console. Model ${st.model}; ${st.used_this_hour} of ${st.max_per_hour} requests used this hour.` }));
@@ -742,7 +875,9 @@
       } }, q, h('div', { class: 'row', style: { marginTop: '8px' } }, btn, status)), out);
     },
     async load() {
+      const ok = begin(this);
       const [hl, rules] = await Promise.all([api('/api/analysis/health'), api('/api/analysis/rules')]);
+      if (!ok()) return;
       const STATUS = { ok: ['good', 'Healthy'], attention: ['medium', 'Needs attention'], critical: ['critical', 'Action needed'] };
       const [cls, label] = STATUS[hl.status] || STATUS.attention;
       clear(this.health).append(h('h2', {}, 'Fleet health'),
@@ -762,11 +897,13 @@
         { label: 'Top program', cell: (r) => (r.programs[0] ? h('code', { text: `${r.programs[0].program} (${Math.round((100 * r.programs[0].alerts) / r.alerts)}%)` }) : '–') },
         { label: 'Assessment', cell: (r) => { const [c, t] = ASSESS[r.assessment] || ASSESS.ok; return r.assessment === 'ok' ? h('span', { class: 'muted', text: t }) : h('span', { class: `sev ${c}` }, icon(`i-sev-${c}`), t); } },
         { label: 'AI', cell: (r) => (r.ai ? h('span', { class: 'badge ai', text: cap(r.ai.result.verdict.replace('_', ' ')) }) : h('span', { class: 'muted', text: '–' })) },
-      ], rules, { page: 50, onRow: (r) => this.ruleDrawer(r), rowLabel: (r) => `Rule ${r.rule}`, emptyNode: empty('No alerts yet', 'Rules are reviewed once they fire.') }));
+      ], rules, { page: 50, state: this.tv, onRow: (r) => this.ruleDrawer(r), rowLabel: (r) => `Rule ${r.rule}`, emptyNode: empty('No alerts yet', 'Rules are reviewed once they fire.') }));
     },
     ruleDrawer(r) {
-      openDrawer(`Rule ${r.rule}`, async (body) => {
-        if (!aiStatus) await getAiStatus();
+      const key = 'rule:' + r.rule;
+      openDrawer(`Rule ${r.rule}`, async (body, live) => {
+        const st = await getAiStatus();
+        if (!live()) return;
         clear(body);
         body.append(h('p', { class: 'lead', text: r.title }));
         body.append(h('dl', { class: 'kv' },
@@ -780,19 +917,28 @@
         const aiBox = h('div', {}, h('h3', { text: 'AI review' }));
         if (r.ai) {
           const res = r.ai.result;
+          // Lines the console rejected (res.dropped) are shown apart from the
+          // accepted ones, never as copyable rule lines.
+          const dropped = res.dropped || [];
+          const reason = new Map(dropped.map((d) => [String(d.rule_line || '').trim(), d.reason || 'rejected']));
+          const props = res.proposals || [];
+          const accepted = props.filter((p) => !reason.has(String(p.rule_line || '').trim()));
+          const rejected = props.filter((p) => reason.has(String(p.rule_line || '').trim()));
           aiBox.append(h('div', { class: 'card ai-card' }, h('div', { class: 'row' }, aiBadge(), h('b', { text: cap(res.verdict.replace('_', ' ')) }), h('span', { class: 'muted grow', style: { textAlign: 'right' } }, timeEl(r.ai.ts))),
             h('p', { text: res.assessment }),
-            (res.proposals || []).map((p) => h('div', {}, h('div', { class: 'muted', text: `${cap(p.change)}: ${p.rationale}` }), h('pre', { class: 'block', text: p.rule_line }))),
-            res.suggestions && res.suggestions.length ? h('p', { class: 'hint' }, 'Valid rule lines were added to ', h('a', { href: '/suggestions' }, 'Suggestions'), ' for approval.') : null));
+            accepted.map((p) => h('div', {}, h('div', { class: 'muted', text: `${cap(p.change)}: ${p.rationale}` }), h('pre', { class: 'block', text: p.rule_line }))),
+            res.suggestions && res.suggestions.length ? h('p', { class: 'hint' }, 'These rule lines passed the console\'s checks and were added to ', h('a', { href: '/suggestions' }, 'Suggestions'), ' for approval. AI suggestion — review before approving.') : null,
+            rejected.length || dropped.length ? h('div', { class: 'rejected' }, h('p', { class: 'hint' }, h('b', { text: `Rejected by the console's checks (${dropped.length || rejected.length}) — do not use:` })),
+              h('ul', { class: 'findings' }, (dropped.length ? dropped : rejected).map((d) => h('li', {}, h('code', { class: 'struck', text: d.rule_line || '' }), ` — ${d.reason || reason.get(String(d.rule_line || '').trim()) || 'rejected'}`)))) : null));
         }
         aiBox.append(aiButton(r.ai ? 'Review again' : 'Ask AI to review this rule', 'curate', { rule: r.rule }, async () => {
           const fresh = (await api('/api/analysis/rules')).find((x) => x.rule === r.rule);
-          if (fresh) this.ruleDrawer(fresh);
-          if (current === this) this.load();
-        }));
+          if (fresh && drawerShows(key)) this.ruleDrawer(fresh);
+          if (current === this) refresh();
+        }, st));
         body.append(aiBox);
         body.append(h('a', { class: 'btn small', href: `/alerts${qs({ rule: r.rule, status: 'all' })}` }, 'All alerts for this rule'));
-      });
+      }, key);
     },
   };
 
@@ -800,9 +946,15 @@
     title: 'Hosts',
     mount(main, params) {
       this.f = { state: params.get('state') || '', group: params.get('group') || '', q: params.get('q') || '' };
-      const sync = () => { history.replaceState(null, '', '/hosts' + qs(this.f)); this.load(); };
-      const q = h('input', { id: 'host-q', type: 'search', placeholder: 'Filter by hostname…', value: this.f.q, oninput: debounce(() => { this.f.q = q.value; this.render(); }) });
-      this.groupSel = select('host-group', [['', 'All groups']], this.f.group, (v) => { this.f.group = v; sync(); });
+      const sync = () => { this.tv = {}; history.replaceState(null, '', '/hosts' + qs(this.f)); refresh(); };
+      const q = h('input', { id: 'host-q', type: 'search', placeholder: 'Filter by hostname…', value: this.f.q, oninput: debounce(() => { this.f.q = q.value; this.tv = {}; this.render(); }) });
+      // The deep-linked group is an option from the start, so the control
+      // shows the filter that is actually applied.
+      this.groups = new Set(this.f.group ? [this.f.group] : []);
+      this.groupSel = select('host-group', [['', 'All groups'], ...[...this.groups].map((g) => [g, g])], this.f.group, (v) => { this.f.group = v; sync(); });
+      // Group names come from the summary once per visit, not on every tick.
+      const sel = this.groupSel;
+      api('/api/summary').then((sm) => { if (sel === this.groupSel && sel.isConnected) this.addGroups(Object.keys((sm.hosts && sm.hosts.groups) || {}), sel); }).catch(() => {});
       main.append(h('div', { class: 'filters' },
         h('div', { class: 'field search' }, h('label', { for: 'host-q', text: 'Search' }), q),
         h('div', { class: 'field' }, h('label', { text: 'State' }), seg([['', 'Live'], ['active', 'Active'], ['stale', 'Stale'], ['decommissioned', 'Decommissioned'], ['all', 'All']], this.f.state, (v) => { this.f.state = v; sync(); }, 'State')),
@@ -811,12 +963,18 @@
       this.out = h('div', {}, h('div', { class: 'loading', text: 'Loading hosts…' }));
       main.append(this.meta, this.out);
     },
+    addGroups(names, sel = this.groupSel) {
+      const before = this.groups.size;
+      for (const g of names) if (g) this.groups.add(g);
+      if (this.groups.size === before && sel.options.length === before + 1) return;
+      clear(sel).append(h('option', { value: '', text: 'All groups' }), [...this.groups].sort().map((g) => h('option', { value: g, text: g })));
+      sel.value = this.f.group;
+    },
     async load() {
-      const [rows, all] = await Promise.all([api('/api/hosts' + qs({ state: this.f.state, group: this.f.group })), api('/api/hosts?state=all')]);
-      const groups = [...new Set(all.map((x) => x.group).filter(Boolean))].sort();
-      const cur = this.groupSel.value;
-      clear(this.groupSel).append(h('option', { value: '', text: 'All groups' }), groups.map((g) => h('option', { value: g, text: g })));
-      this.groupSel.value = cur;
+      const ok = begin(this);
+      const rows = await api('/api/hosts' + qs({ state: this.f.state, group: this.f.group }));
+      if (!ok()) return;
+      this.addGroups(rows.map((x) => x.group));
       this.rows = rows;
       this.render();
     },
@@ -833,7 +991,7 @@
         { label: 'Alerts', num: true, cell: (x) => fmtNum(x.alerts) },
         { label: 'Version', cell: (x) => x.version || '–' },
         { label: 'Last seen', cell: (x) => timeEl(x.last_seen) },
-      ], rows, { page: 100, onRow: (x) => hostDrawer(x.name), rowLabel: (x) => `Host ${x.name}, ${x.state}`,
+      ], rows, { page: 100, state: this.tv, onRow: (x) => hostDrawer(x.name), rowLabel: (x) => `Host ${x.name}, ${x.state}`,
         emptyNode: this.rows && this.rows.length ? empty('No hosts match the filter') : onboarding() }));
     },
   };
@@ -846,7 +1004,16 @@
       const inp = (k, label, attrs = {}) => { const el = h('input', { id: `inv-${k}`, value: this.f[k], ...attrs }); this[k] = el; return h('div', { class: 'field' }, h('label', { for: `inv-${k}`, text: label }), el); };
       const typeSel = select('inv-type', [['', 'Any type'], ['alert', 'Alerts'], ['inventory', 'Inventory'], ['lifecycle', 'Host lifecycle'], ['hello', 'Sensor connects'], ['bye', 'Sensor exits'], ['triage', 'Triage'], ['rollout', 'Rollouts']], this.f.type, () => {});
       this.typeSel = typeSel;
-      const local = (iso) => (iso ? iso.slice(0, 16) : '');
+      // datetime-local inputs hold local wall-clock time without a zone: show
+      // the UTC bound from the URL in local time, and remember what was shown
+      // so an untouched field submits the original value unchanged.
+      const pad = (n) => String(n).padStart(2, '0');
+      const local = (iso) => {
+        const d = iso ? new Date(iso) : null;
+        if (!d || isNaN(d)) return '';
+        return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+      };
+      this.shown = { since: local(this.f.since), until: local(this.f.until) };
       const form = h('form', { class: 'card', onsubmit: (e) => { e.preventDefault(); this.submit(); } },
         h('div', { class: 'planner' },
           h('div', { class: 'field' }, h('label', { for: 'inv-q', text: 'Contains text' }), this.q = h('input', { id: 'inv-q', type: 'search', value: this.f.q, placeholder: 'e.g. id_rsa, 10.0.0.5, curl' })),
@@ -860,18 +1027,29 @@
       this.meta = h('div', { class: 'result-meta', style: { marginTop: '16px' } });
       this.out = h('div', {});
       main.append(this.meta, this.out);
+      // A search is a point-in-time query: no auto-refresh here (it would
+      // collapse expanded events). Search again to update.
       this.auto = false;
     },
     submit() {
-      const toIso = (v) => (v ? new Date(v).toISOString() : '');
-      this.f = { q: this.q.value.trim(), type: this.typeSel.value, host: this.host.value.trim(), rule: this.rule.value.trim(), actor: this.actor.value.trim(), pid: this.pid.value.trim(), since: toIso(this.since.value), until: toIso(this.until.value) };
+      const toIso = (k, v) => {
+        if (!v) return '';
+        if (v === this.shown[k] && this.f[k]) return this.f[k];
+        const d = new Date(v); // no zone suffix: parsed as local time
+        return isNaN(d) ? '' : d.toISOString();
+      };
+      const f = { q: this.q.value.trim(), type: this.typeSel.value, host: this.host.value.trim(), rule: this.rule.value.trim(), actor: this.actor.value.trim(), pid: this.pid.value.trim(), since: toIso('since', this.since.value), until: toIso('until', this.until.value) };
+      this.shown = { since: this.since.value, until: this.until.value };
+      this.f = f;
       history.replaceState(null, '', '/investigate' + qs(this.f));
-      this.load();
+      refresh();
     },
     async load() {
+      const ok = begin(this);
       const has = Object.values(this.f).some(Boolean);
       if (!has) { this.meta.textContent = ''; clear(this.out).append(empty('Search the event journal', 'Set at least one filter above. Results are newest first.')); return; }
       const rows = await api('/api/events' + qs({ ...this.f, limit: 300 }));
+      if (!ok()) return;
       this.meta.textContent = rows.length >= 300 ? 'Showing the newest 300 matching events' : `${fmtNum(rows.length)} matching event${rows.length === 1 ? '' : 's'}`;
       if (!rows.length) { clear(this.out).append(empty('No events match', 'Widen the time range or remove a filter.')); return; }
       clear(this.out).append(h('ul', { class: 'timeline' }, rows.map((e) => h('li', {}, h('details', {},
@@ -887,7 +1065,7 @@
       this.tier = params.get('tier') || '';
       this.q = '';
       this.segWrap = h('div', { class: 'field' }, h('label', { text: 'Tier' }));
-      const q = h('input', { id: 'vuln-q', type: 'search', placeholder: 'Package, CVE or host…', oninput: debounce(() => { this.q = q.value.toLowerCase(); this.render(); }, 150) });
+      const q = h('input', { id: 'vuln-q', type: 'search', placeholder: 'Package, CVE or host…', oninput: debounce(() => { this.q = q.value.toLowerCase(); this.tv = {}; this.render(); }, 150) });
       main.append(h('p', { class: 'muted', style: { marginTop: 0 } }, 'Ranked by what an attacker can actually use: ', h('b', { text: 'exploited' }), ' (an alert on the host involves the package), ',
         h('b', { text: 'reachable' }), ' (affected version installed and its runtime is executing), ', h('b', { text: 'dormant' }), ' (installed, runtime not seen running), ', h('b', { text: 'theoretical' }), ' (version unknown).'));
       main.append(h('div', { class: 'filters' }, h('div', { class: 'field search' }, h('label', { for: 'vuln-q', text: 'Search' }), q), this.segWrap));
@@ -895,11 +1073,14 @@
       main.append(this.out);
     },
     async load() {
-      this.rows = await api('/api/vulns');
+      const ok = begin(this);
+      const rows = await api('/api/vulns');
+      if (!ok()) return;
+      this.rows = rows;
       const counts = {};
       for (const f of this.rows) counts[f.tier] = (counts[f.tier] || 0) + 1;
       const opts = [['', `All (${this.rows.length})`], ...['exploited', 'reachable', 'dormant', 'theoretical'].map((t) => [t, `${cap(t)} (${counts[t] || 0})`])];
-      this.segWrap.replaceChildren(h('label', { text: 'Tier' }), seg(opts, this.tier, (v) => { this.tier = v; history.replaceState(null, '', '/vulnerabilities' + qs({ tier: v })); this.render(); }, 'Tier'));
+      this.segWrap.replaceChildren(h('label', { text: 'Tier' }), seg(opts, this.tier, (v) => { this.tier = v; this.tv = {}; history.replaceState(null, '', '/vulnerabilities' + qs({ tier: v })); this.render(); }, 'Tier'));
       this.render();
     },
     render() {
@@ -911,7 +1092,7 @@
         { label: 'Host', cell: (f) => f.host },
         { label: 'CVSS', num: true, cell: (f) => (f.cvss ? f.cvss.toFixed(1) : '–') },
         { label: 'Why this tier', cell: (f) => h('span', { class: 'muted', text: f.note || '' }) },
-      ], rows, { page: 100, onRow: (f) => hostDrawer(f.host), rowLabel: (f) => `${f.tier} ${f.cve} ${f.name} on ${f.host}`, emptyNode: empty(this.rows.length ? 'No findings match' : 'No known-vulnerable software on the fleet', this.rows.length ? '' : 'Findings appear as sensors report their inventory.') }));
+      ], rows, { page: 100, state: this.tv, rowKey: (f) => `${f.host} ${f.cve} ${f.name}`, onRow: (f) => hostDrawer(f.host), rowLabel: (f) => `${f.tier} ${f.cve} ${f.name} on ${f.host}`, emptyNode: empty(this.rows.length ? 'No findings match' : 'No known-vulnerable software on the fleet', this.rows.length ? '' : 'Findings appear as sensors report their inventory.') }));
     },
   };
 
@@ -919,7 +1100,9 @@
     title: 'Posture',
     mount(main) { this.el = main; main.append(h('div', { class: 'loading', text: 'Scoring the fleet…' })); },
     async load() {
+      const ok = begin(this);
       const p = await api('/api/posture');
+      if (!ok()) return;
       const main = clear(this.el);
       const grades = { A: 0, B: 0, C: 0, D: 0, F: 0 };
       for (const x of p.hosts) grades[x.grade]++;
@@ -940,7 +1123,7 @@
         { label: 'Mode', cell: (x) => modeBadge(x.mode) },
         { label: 'Identity', cell: (x) => TRUST[x.trust] || x.trust || '–' },
         { label: 'Findings', cell: (x) => (x.findings.length ? h('ul', { class: 'findings' }, x.findings.map((f) => h('li', { text: f }))) : h('span', { class: 'muted', text: 'None' })) },
-      ], p.hosts, { page: 100, onRow: (x) => hostDrawer(x.host), rowLabel: (x) => `${x.host} grade ${x.grade}`, emptyNode: onboarding() }));
+      ], p.hosts, { page: 100, state: this.tv, onRow: (x) => hostDrawer(x.host), rowLabel: (x) => `${x.host} grade ${x.grade}`, emptyNode: onboarding() }));
     },
   };
 
@@ -1005,11 +1188,13 @@
       try {
         const r = await api('/api/policy/rollout' + qs({ action: f.action, group: f.group, percent: f.percent }), { method: 'POST' });
         toast(`Rollout sent to ${r.delivered.length} of ${r.cohort.length} host${r.cohort.length === 1 ? '' : 's'}`, r.failed.length > 0);
-        this.load();
+        reloadIf(this)();
       } catch (e) { toast(e.message, true); }
     },
     async load() {
+      const ok = begin(this);
       const rows = await api('/api/policy/rollout');
+      if (!ok()) return;
       clear(this.history).append(table([
         { label: 'When', cell: (r) => timeEl(r.ts) },
         { label: 'Change', cell: (r) => actionLabel(r.action) },
@@ -1028,9 +1213,11 @@
     title: 'Settings',
     mount(main) { this.el = main; },
     async load() {
+      const ok = begin(this);
       const [v, ai] = await Promise.all([api('/api/version'), getAiStatus()]);
+      if (!ok()) return;
       const main = clear(this.el);
-      const perms = { viewer: 'View everything on the console.', deployer: 'View, plus run staged rollouts and approve rollout suggestions.', operator: 'Deployer, plus triage, approve suggestions, ask the AI assistant, push policy to single hosts and read vault secrets.', admin: 'Everything, including writing vault secrets.' };
+      const perms = { viewer: 'View everything on the console.', deployer: 'View, plus run staged rollouts and decide the suggestions that need the deployer role.', operator: 'Deployer, plus triage, decide suggestions, ask the AI assistant, push policy to single hosts and read vault secrets.', admin: 'Everything, including writing vault secrets.' };
       main.append(h('div', { class: 'grid two' },
         h('div', { class: 'card' }, h('h2', { text: 'Account' }),
           h('dl', { class: 'kv' }, h('dt', { text: 'Signed in as' }), h('dd', { text: me.name || '–' }), h('dt', { text: 'Role' }), h('dd', {}, h('b', { text: cap(me.role) }), h('div', { class: 'muted', text: perms[me.role] || '' }))),
@@ -1057,30 +1244,64 @@
 
   // ---- router + refresh loop -----------------------------------------------
   const ROUTES = { '/': 'overview', '/incidents': 'incidents', '/suggestions': 'suggestions', '/analysis': 'analysis', '/alerts': 'alerts', '/hosts': 'hosts', '/investigate': 'investigate', '/vulnerabilities': 'vulnerabilities', '/posture': 'posture', '/rollouts': 'rollouts', '/settings': 'settings' };
-  let current = null, timer = null, paused = false, loading = false;
+  let current = null, timer = null, paused = false, inflight = null;
 
   async function render() {
     const name = ROUTES[location.pathname] || 'overview';
     const page = pages[name];
+    // A route change closes whatever dialog belonged to the previous page.
+    closeDrawer(false);
+    if (confirmCancel) confirmCancel(false);
+    tip.hide();
     current = page;
     document.querySelectorAll('.side nav a').forEach((a) => { if (a.dataset.route === name) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current'); });
     $('#title').textContent = page.title;
     document.title = `${page.title} · Wisp Console`;
-    const main = clear($('#main'));
-    page.mount(main, new URLSearchParams(location.search));
-    await refresh(true);
-    $('#side').classList.remove('open');
-    $('#menu').setAttribute('aria-expanded', 'false');
+    // Each mount gets its own container: a late response from a page the user
+    // left can only touch that page's (now detached) nodes.
+    const root = h('div', { class: 'page' });
+    clear($('#main')).append(root);
+    page.root = root; page.out = undefined; page.tv = {};
+    page.mount(root, new URLSearchParams(location.search));
+    setNav(false);
+    await refresh({ first: true });
   }
-  async function refresh(first) {
-    if (!current || loading) return;
-    loading = true;
+  // Keyboard focus and open <details> survive a rebuild when they carry a
+  // data-key (table rows, the chart's table view).
+  function snapshot(root) {
+    const ae = document.activeElement;
+    const focus = ae && ae !== root && root.contains(ae) && ae.dataset ? ae.dataset.key || null : null;
+    return { focus, open: [...root.querySelectorAll('details[open][data-key]')].map((d) => d.dataset.key) };
+  }
+  function restore(root, snap) {
+    for (const k of snap.open) { const d = root.querySelector(`details[data-key="${CSS.escape(k)}"]`); if (d) d.open = true; }
+    const ae = document.activeElement;
+    if (snap.focus && (!ae || ae === document.body || ae === root)) {
+      const el = root.querySelector(`[data-key="${CSS.escape(snap.focus)}"]`);
+      if (el) el.focus({ preventScroll: true });
+    }
+  }
+  // Every navigation and filter change gets its own load (never dropped);
+  // only the periodic tick skips while a load of the same page is running.
+  // Stale responses are discarded inside load() via begin().
+  async function refresh({ first = false, auto = false } = {}) {
+    const page = current;
+    if (!page) return;
+    if (auto && inflight && inflight.page === page) return;
+    const root = $('#main');
+    const snap = first ? null : snapshot(root);
+    if (auto) tip.hide();
+    const p = page.load();
+    const tok = page._tok;
+    const entry = { page }; inflight = entry;
+    const isLatest = () => current === page && page._tok === tok;
     try {
-      await current.load();
+      await p;
+      if (snap && isLatest()) restore(root, snap);
       updateNavCount();
     } catch (e) {
-      if (e.status !== 401 && first) clear($('#main')).append(errorBox(e));
-    } finally { loading = false; paintLive(); }
+      if (e.status !== 401 && !auto && isLatest()) clear(page.out || page.root || root).append(errorBox(e));
+    } finally { if (inflight === entry) inflight = null; paintLive(); }
   }
   async function updateNavCount() {
     try {
@@ -1093,14 +1314,25 @@
       cs.textContent = String(sg.length); cs.hidden = !sg.length; cs.title = `${sg.length} suggestion${sg.length === 1 ? '' : 's'} waiting for approval`;
     } catch { /* shown by banner */ }
   }
+  // Skip a tick rather than rebuild under the user: typing, a focused control
+  // that cannot be restored by key, a text selection, or an expanded detail.
+  function userBusy() {
+    const main = $('#main'), ae = document.activeElement;
+    if (ae && ae.matches('input,select,textarea')) return true;
+    if (ae && ae !== main && main.contains(ae) && !(ae.dataset && ae.dataset.key)) return true;
+    const sel = getSelection();
+    if (sel && !sel.isCollapsed && sel.anchorNode && main.contains(sel.anchorNode)) return true;
+    if (main.querySelector('details[open]:not([data-key])')) return true;
+    return false;
+  }
   function schedule() {
     clearInterval(timer);
     const secs = Number(store.pref('refresh', '10'));
     if (!secs) return;
     timer = setInterval(() => {
-      if (paused || document.hidden || !$('#drawer').hidden || !$('#confirm').hidden) { paintLive(); return; }
-      if (document.activeElement && document.activeElement.matches('input,select,textarea')) { paintLive(); return; }
-      refresh(false);
+      if (paused || document.hidden || !$('#drawer').hidden || !$('#confirm').hidden || !current || current.auto === false) { paintLive(); return; }
+      if (userBusy()) { paintLive(); return; }
+      refresh({ auto: true });
     }, secs * 1000);
   }
   function navigate(path) {
@@ -1108,11 +1340,23 @@
     render();
     $('#main').focus();
   }
+  // Off-canvas navigation on narrow screens.
+  function setNav(open, focus = false) {
+    const side = $('#side'), was = side.classList.contains('open');
+    side.classList.toggle('open', open);
+    $('#menu').setAttribute('aria-expanded', String(open));
+    $('#nav-backdrop').hidden = !open;
+    if (focus && open) { const a = side.querySelector('nav a[aria-current]') || side.querySelector('nav a'); if (a) a.focus(); }
+    if (focus && !open && was) $('#menu').focus();
+  }
+  const navNarrow = () => getComputedStyle($('#menu')).display !== 'none';
 
   // ---- sign-in -------------------------------------------------------------
   function showSignin(msg) {
     clearInterval(timer);
-    $('#app').hidden = true; $('#drawer').hidden = true; $('#signin').hidden = false;
+    closeDrawer(false);
+    if (confirmCancel) confirmCancel(false);
+    $('#app').hidden = true; $('#signin').hidden = false;
     const err = $('#signin-err');
     err.textContent = msg || ''; err.hidden = !msg;
     $('#token').value = ''; $('#token').focus();
@@ -1151,13 +1395,27 @@
       const b = $('#pause');
       clear(b).append(icon(paused ? 'i-play' : 'i-pause'));
       b.setAttribute('aria-label', paused ? 'Resume auto-refresh' : 'Pause auto-refresh'); b.title = b.getAttribute('aria-label');
-      if (!paused) refresh(false);
+      if (!paused) refresh({ auto: true });
       paintLive();
     });
-    $('#menu').addEventListener('click', () => { const o = $('#side').classList.toggle('open'); $('#menu').setAttribute('aria-expanded', String(o)); });
-    $('#drawer-close').addEventListener('click', closeDrawer);
+    $('#menu').addEventListener('click', () => setNav(!$('#side').classList.contains('open'), true));
+    $('#nav-backdrop').addEventListener('click', () => setNav(false, true));
+    $('#drawer-close').addEventListener('click', () => closeDrawer());
     $('#drawer').addEventListener('click', (e) => { if (e.target.id === 'drawer') closeDrawer(); });
-    $('#drawer').addEventListener('keydown', (e) => { if (e.key === 'Escape') closeDrawer(); trapFocus($('#drawer'), e); });
+    // Escape and the focus trap are handled at document level so they work
+    // even after focus has dropped to <body> (e.g. after clicking text).
+    document.addEventListener('keydown', (e) => {
+      if (!$('#confirm').hidden) {
+        if (e.key === 'Escape') { e.preventDefault(); confirmCancel && confirmCancel(); return; }
+        trapFocus($('#confirm'), e); return;
+      }
+      if (drawerOpen()) {
+        if (e.key === 'Escape') { e.preventDefault(); closeDrawer(); return; }
+        trapFocus($('#drawer'), e); return;
+      }
+      if (e.key === 'Escape' && $('#side').classList.contains('open')) { setNav(false, true); return; }
+      if (e.key === 'Tab' && $('#side').classList.contains('open') && navNarrow()) trapFocus($('#side'), e);
+    });
     $('#signin-form').addEventListener('submit', async (e) => {
       e.preventDefault();
       const tok = $('#token').value.trim();
@@ -1170,17 +1428,24 @@
     document.addEventListener('click', (e) => {
       const a = e.target.closest('a[href]');
       if (!a || a.target || e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+      const href = a.getAttribute('href');
+      if (href.startsWith('#')) {
+        // In-page anchors (the skip link): move focus, never re-mount the page.
+        e.preventDefault();
+        const t = href.length > 1 && document.getElementById(href.slice(1));
+        if (t) t.focus();
+        return;
+      }
       const url = new URL(a.href, location.href);
       if (url.origin !== location.origin || !(url.pathname in ROUTES)) return;
       e.preventDefault();
-      if (!$('#drawer').hidden) $('#drawer').hidden = true;
       navigate(url.pathname + url.search);
     });
-    addEventListener('popstate', render);
+    addEventListener('popstate', () => { if (!$('#app').hidden) render(); });
     // keyboard: "g x" navigation, "/" search
     let g = false;
     document.addEventListener('keydown', (e) => {
-      if (e.target.matches('input,select,textarea') || e.metaKey || e.ctrlKey || e.altKey || $('#app').hidden) return;
+      if (e.target.matches('input,select,textarea') || e.metaKey || e.ctrlKey || e.altKey || $('#app').hidden || !$('#confirm').hidden) return;
       if (e.key === '/') { const s = $('#main input[type="search"]'); if (s) { e.preventDefault(); s.focus(); } return; }
       if (g) { g = false; const m = { o: '/', n: '/incidents', u: '/suggestions', y: '/analysis', a: '/alerts', h: '/hosts', i: '/investigate', v: '/vulnerabilities', p: '/posture', r: '/rollouts', s: '/settings' }[e.key]; if (m) navigate(m); return; }
       if (e.key === 'g') { g = true; setTimeout(() => (g = false), 1200); }
