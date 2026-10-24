@@ -20,8 +20,15 @@
 make            # sensor + console
 make test       # console tests under ASan+UBSan and TSan, UI syntax, shipped policy
                 # (the AI tests use an in-process mock of the Claude API; needs the openssl CLI)
-make verify     # full integration suite; needs root and a BTF kernel
+make verify     # integration suite; needs root and a BTF kernel
 ```
+
+`make verify` runs sensors in enforce mode as root. Run it on a disposable
+VM or CI runner, never on a production host. It keeps its files in a private
+temporary directory and stops only its own processes, and it refuses to run
+where Wisp is installed or running unless you pass `VERIFY_FLAGS=--force`.
+Quarantine tests may only target copies of binaries inside that scratch
+directory, matched by `exe^=` path prefix, never by command line.
 
 - Keep the sensor inside its CPU budget: any change to the per-exec path must
   keep `make verify`'s CPU checks under 0.05% of one core.
@@ -40,7 +47,7 @@ make
 # save the roles.conf line to ./roles.conf
 bash bench/mkpki.sh                                # test certificates in ./pki
 ./console/wisp-console -cert pki/console.crt -key pki/console.key \
-  -client-ca pki/ca.crt -roles roles.conf -state-dir /tmp/wisp-demo &
+  -client-ca pki/ca.crt -roles roles.conf -state-dir "$(mktemp -d)" &
 python3 bench/demo_fleet.py                        # 20 simulated hosts
 open http://127.0.0.1:8080                          # sign in with the token
 ```

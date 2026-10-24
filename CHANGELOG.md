@@ -3,9 +3,75 @@
 All notable changes to Wisp. Versions follow [Semantic Versioning](https://semver.org/);
 the single source of truth is the `VERSION` file.
 
-## Unreleased
+## 1.1.0
+
+This release adds the analysis engine and AI assistant, rewrites the console
+in C++, and includes a production-readiness review of the whole product.
+Several defaults are stricter: read **Upgrade notes** before upgrading.
+
+### Production-readiness fixes
+- **Sensor**: kill and quarantine responses are safe against PID reuse (the
+  process tree is frozen and identified before it is acted on), and
+  quarantine refuses to remove operating-system files (root-owned files in
+  root-only directories). A failed quarantine is reported in the alert
+  (`quarantine_error`) instead of being reported as done.
+- **Console**: a sensor's host identity is bound to its client certificate.
+  Placeholder tokens (`CHANGE-ME-…`) are refused, `SIGHUP` reloads
+  `roles.conf`, new vault stores need at least 32 characters of key material,
+  and `-decommission-after` must be 0 or at least `-stale-after`.
+- **AI assistant**: fixes to the API request headers and to the redaction of
+  fleet data before it is sent.
+- **Web console**: assorted UI fixes.
+- **SDKs**: the Python and TypeScript clients verify TLS certificates by
+  default.
+- **Packaging**:
+  - `install.sh --root DIR` enables the unit inside the image, so the sensor
+    starts on first boot;
+  - re-running the installer restarts a running sensor onto the new binary;
+  - `PREFIX` is honoured by the installed units;
+  - `--uninstall` honours `--root`;
+  - a new `--console` mode (also used by `make install-console`) installs the
+    console from the release tarball;
+  - unattended installs fail when `WISP_CONSOLE` is set without a CA,
+    certificate and key, or `WISP_TPM=1` without a key. The key comes from
+    `WISP_KEY_PEM(_FILE)` or `WISP_KEY_PATH`;
+  - new `*_PEM_FILE` variables keep key material off `sudo`'s command line;
+  - config values are written literally.
+- **systemd units**: `wispd.service` no longer has write access to home or
+  temporary directories (quarantine reaches a running program through
+  `/proc/<pid>/root`). `wisp-console.service` orders after `time-sync.target`
+  and has `ExecReload`; credentials are refreshed on reload only with
+  systemd 260+, otherwise restart it. An hourly `wisp-logrotate.timer` makes
+  the logs' `maxsize` effective.
+- **Shipped configuration**: `roles.conf` contains comments only, and the
+  example network rules and the TypeScript version pin are commented out.
+  `LOL-002` now fires on crontab installs (`crontab FILE`) and no longer on
+  `crontab -l`.
+- **Release**: binaries are built on a Debian 12 baseline and stripped
+  (debug info ships in a separate `-debug` tarball). The tarball is
+  reproducible and includes the console installer, PKI helpers, SDKs and the
+  MCP server.
+- **Tests**:
+  - `bench/verify.sh` works in a private temporary directory and stops only
+    its own processes. It refuses to run on a host with Wisp installed
+    unless given `--force`.
+  - It now covers quarantine (of a scratch copy), mTLS rejection of a
+    missing or foreign client certificate, AI redaction and host identity.
+  - The load generator holds its target rate and reports the rate it
+    achieved.
+  - CI runs the SDK and MCP checks.
+
+### Upgrade notes
+- Replace any `CHANGE-ME` tokens in `roles.conf` with `wisp-console -gen-token`
+  lines before upgrading the console; it will not start with them.
+- A sensor with `console =` set needs `ca =` (and `cert =`/`key =`).
+- The shipped `netpolicy.conf` and `catalog.conf` no longer contain active example
+  rules; if you relied on them, copy them back in uncommented.
+- The sensor unit cannot remove a binary whose process had already exited
+  when the rule fired; such alerts carry `quarantine_error`.
 
 ### Analysis and AI assistance
+
 - **Incidents**: alerts on a host that share an actor or a process lineage
   and are close in time are correlated into one incident. It is scored 0–100
   with the reason for every point (severity, attack-chain breadth, campaign

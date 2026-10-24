@@ -4,13 +4,16 @@ receives into <outdir>/<host>.ctl so a test can see who a rollout reached.
 
 usage: fleetsim.py N group outdir seconds [silent_host]
 silent_host stops heartbeating after 1s (to exercise stale/decommission).
+Environment: WISP_CONSOLE (ingest host:port, default 127.0.0.1:8750) and
+WISP_PKI (directory with ca.crt, agent.crt, agent.key; default ../pki).
 """
 import json, os, socket, ssl, sys, threading, time
 
 N, group, outdir, secs = int(sys.argv[1]), sys.argv[2], sys.argv[3], float(sys.argv[4])
 silent = sys.argv[5] if len(sys.argv) > 5 else None
 root = os.path.dirname(os.path.abspath(__file__))
-pki = os.path.join(root, "..", "pki")
+pki = os.environ.get("WISP_PKI") or os.path.join(root, "..", "pki")
+chost, cport = os.environ.get("WISP_CONSOLE", "127.0.0.1:8750").rsplit(":", 1)
 os.makedirs(outdir, exist_ok=True)
 
 
@@ -23,7 +26,7 @@ def host(i):
     ctx = ssl.create_default_context(cafile=f"{pki}/ca.crt")
     ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT  # demo CA lacks keyUsage; the C agent accepts it
     ctx.load_cert_chain(f"{pki}/agent.crt", f"{pki}/agent.key")
-    s = ctx.wrap_socket(socket.create_connection(("127.0.0.1", 8750)), server_hostname="localhost")
+    s = ctx.wrap_socket(socket.create_connection((chost, int(cport))), server_hostname="localhost")
     send = lambda o: s.sendall((json.dumps(o) + "\n").encode())
     send({"type": "hello", "host": name, "group": group, "version": "0.1.0",
           "host_id": f"id-{name}", "trust": "tpm" if i % 3 else "generated", "ephemeral": False})

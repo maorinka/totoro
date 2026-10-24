@@ -9,14 +9,16 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 PKI=pki
-mkdir -p "$PKI" /tmp/swtpm
+mkdir -p "$PKI"
+W=$(mktemp -d "${TMPDIR:-/tmp}/wisp-tpm.XXXXXXXX")  # private scratch: TPM state, nonce, signature
+mkdir -p "$W/swtpm"
 
 echo "==> starting software TPM 2.0 (swtpm)"
-pkill -x swtpm 2>/dev/null || true
-sleep 0.3
-swtpm socket --tpmstate dir=/tmp/swtpm --ctrl type=tcp,port=2322 \
-  --server type=tcp,port=2321 --tpm2 --flags not-need-init,startup-clear \
-  >/tmp/swtpm.log 2>&1 &
+swtpm socket --tpmstate dir="$W/swtpm" --ctrl type=tcp,port=2322,bindaddr=127.0.0.1 \
+  --server type=tcp,port=2321,bindaddr=127.0.0.1 --tpm2 --flags not-need-init,startup-clear \
+  >"$W/swtpm.log" 2>&1 &
+SWTPM=$!
+echo "    swtpm pid $SWTPM, state in $W (stop it with: kill $SWTPM)"
 sleep 1
 export TPM2OPENSSL_TCTI="swtpm:host=127.0.0.1,port=2321"
 export TPM2TOOLS_TCTI="$TPM2OPENSSL_TCTI"
@@ -28,11 +30,11 @@ echo "    key file is a TPM blob, not a raw key:"
 head -1 "$PKI/agent_tpm.key"
 
 echo "==> proving the TPM signs (sign a nonce in the TPM, verify with the pubkey)"
-echo "nonce-$(date +%s%N)" > /tmp/n.txt
+echo "nonce-$(date +%s%N)" > "$W/n.txt"
 openssl pkeyutl -provider tpm2 -provider default -sign -inkey "$PKI/agent_tpm.key" \
-  -rawin -in /tmp/n.txt -out /tmp/n.sig
-openssl pkey -provider tpm2 -provider default -in "$PKI/agent_tpm.key" -pubout -out /tmp/n.pub 2>/dev/null
-openssl pkeyutl -provider default -verify -pubin -inkey /tmp/n.pub -rawin -in /tmp/n.txt -sigfile /tmp/n.sig
+  -rawin -in "$W/n.txt" -out "$W/n.sig"
+openssl pkey -provider tpm2 -provider default -in "$PKI/agent_tpm.key" -pubout -out "$W/n.pub" 2>/dev/null
+openssl pkeyutl -provider default -verify -pubin -inkey "$W/n.pub" -rawin -in "$W/n.txt" -sigfile "$W/n.sig"
 
 echo "==> issuing an EC CA + console cert, and a CA-signed cert for the TPM key"
 openssl ecparam -name prime256v1 -genkey -noout -out "$PKI/ca-ec.key"

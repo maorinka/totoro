@@ -1,9 +1,20 @@
 #!/usr/bin/env bash
 # Measure wispd CPU as a percentage of ONE core, idle and under exec load.
-# 0.05% of one core = 0.0005 core-seconds per wall second.
+# 0.05% of one core = 0.0005 core-seconds per wall second. Userspace sensor
+# time only (utime+stime of wispd), not the in-kernel eBPF program.
+#
+# Uses the repository's policy (or CONF=...) with logs and state redirected
+# to a private mktemp directory; starts and stops only its own wispd.
 set -u
-WISPD=${WISPD:-/home/user/wisp-edr/agent/wispd}
-CONF=${CONF:-/etc/wisp/wisp.conf}
+REPO=$(cd "$(dirname "$0")/.." && pwd)
+WISPD=${WISPD:-$REPO/agent/wispd}
+W=$(mktemp -d "${TMPDIR:-/tmp}/wisp-cpubench.XXXXXXXX") || exit 1
+PID=""
+trap '[[ -n "$PID" ]] && kill "$PID" 2>/dev/null; rm -rf "$W"' EXIT
+sed -e "s|/etc/wisp/|$REPO/config/|g" "${CONF:-$REPO/config/wisp.conf}" | grep -vE '^[[:space:]]*(console|cert|key|ca|state_dir|log_dir)[[:space:]]*=' > "$W/wisp.conf"
+printf 'state_dir = %s/state\nlog_dir = %s/log\n' "$W" "$W" >> "$W/wisp.conf"
+mkdir -p "$W/state" "$W/log"
+CONF=$W/wisp.conf
 CLK=$(getconf CLK_TCK)   # usually 100
 
 cpu_ticks() { awk '{print $14+$15}' "/proc/$1/stat" 2>/dev/null; }  # utime+stime
@@ -31,9 +42,9 @@ idle()  { sleep "$1"; }
 load_light() { local end=$((SECONDS+$1)); while [ $SECONDS -lt $end ]; do /bin/true; sleep 0.2; done; }  # ~5/s
 load_busy()  { local end=$((SECONDS+$1)); while [ $SECONDS -lt $end ]; do /bin/true; /bin/true; /bin/true; done; } # as fast as possible
 
-TELE=/var/log/wisp/telemetry.jsonl
-: > "$TELE"; : > /var/log/wisp/alerts.jsonl
-"$WISPD" -c "$CONF" 2>/var/log/wisp/wispd.err &
+TELE=$W/log/telemetry.jsonl
+: > "$TELE"; : > "$W/log/alerts.jsonl"
+"$WISPD" -c "$CONF" 2>"$W/log/wispd.err" &
 PID=$!
 sleep 0.5
 BASE_EXEC=$(wc -l < "$TELE")
@@ -43,5 +54,5 @@ measure "idle (30s)"            30 idle
 measure "light load ~5 exec/s"  20 load_light
 measure "saturating exec loop"  15 load_busy
 echo "-----------------------------------------------------------------------------"
-echo "final RSS=$(awk '/VmRSS/{print $2" "$3}' /proc/$PID/status)  total execs=$(wc -l < "$TELE")  alerts=$(wc -l < /var/log/wisp/alerts.jsonl)"
-kill $PID 2>/dev/null; wait $PID 2>/dev/null
+echo "final RSS=$(awk '/VmRSS/{print $2" "$3}' /proc/$PID/status)  total execs=$(wc -l < "$TELE")  alerts=$(wc -l < "$W/log/alerts.jsonl")"
+kill "$PID" 2>/dev/null; wait "$PID" 2>/dev/null; PID=""
