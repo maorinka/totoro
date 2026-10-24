@@ -22,7 +22,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang llvm libbpf-dev libelf-dev zlib1g-dev libssl-dev \
-            g++ nlohmann-json3-dev linux-tools-common "linux-tools-$(uname -r)" shellcheck
+            g++ nlohmann-json3-dev linux-tools-common linux-tools-generic shellcheck
+          # The runner kernel's own linux-tools package may not exist; the
+          # generic one always provides a real bpftool (agent/Makefile finds it).
+          sudo apt-get install -y "linux-tools-$(uname -r)" || true
+          ls /usr/lib/linux-tools/*/bpftool /usr/lib/linux-tools-*/bpftool 2>/dev/null || true
       - name: Build sensor and console
         run: make
       - name: Unit tests (ASan/UBSan, TSan), policy and UI checks
@@ -175,7 +179,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang llvm libbpf-dev libelf-dev zlib1g-dev libssl-dev \
-            g++ nlohmann-json3-dev linux-tools-common "linux-tools-$(uname -r)" mingw-w64
+            g++ nlohmann-json3-dev linux-tools-common linux-tools-generic mingw-w64
+          # The runner kernel's own linux-tools package may not exist; the
+          # generic one always provides a real bpftool (agent/Makefile finds it).
+          sudo apt-get install -y "linux-tools-$(uname -r)" || true
+          ls /usr/lib/linux-tools/*/bpftool /usr/lib/linux-tools-*/bpftool 2>/dev/null || true
       - name: Full verification suite
         # Detection, enforcement, quarantine (of a scratch copy only), CPU
         # budget, rate limiting, anomalies, forensics, console mTLS/lifecycle/

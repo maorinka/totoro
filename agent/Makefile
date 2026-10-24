@@ -1,6 +1,9 @@
 CC      ?= cc
 CLANG   ?= clang
-BPFTOOL ?= $(firstword $(wildcard /usr/lib/linux-tools-*/bpftool) /usr/sbin/bpftool bpftool)
+# Prefer a real bpftool binary over Ubuntu's /usr/sbin/bpftool wrapper, which
+# refuses to run when no linux-tools package matches the running kernel
+# exactly (e.g. cloud CI kernels). Any bpftool can dump BTF.
+BPFTOOL ?= $(firstword $(wildcard /usr/lib/linux-tools/*/bpftool /usr/lib/linux-tools-*/bpftool) /usr/sbin/bpftool bpftool)
 CFLAGS  ?= -O2 -g -std=gnu11 -Wall -Wextra -Wno-unused-parameter -Wno-format-truncation -D_GNU_SOURCE
 LDFLAGS ?=
 PREFIX  ?= /usr/local
