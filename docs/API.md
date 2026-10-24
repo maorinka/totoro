@@ -56,7 +56,7 @@ connections (see `-http-local-proxy` in
 | GET | `/api/hosts?state=&group=` | hosts. `state`: `active`, `stale`, `decommissioned`, `all`; default is the live fleet (everything not decommissioned) |
 | GET | `/api/hosts/detail?name=` | one host: record, posture with findings, its latest 100 alerts, current software inventory |
 | GET | `/api/alerts?…` | alerts, newest first. Filters: `severity` (minimum: `low` … `critical`), `status` (`open`, `acknowledged`, `resolved`, `all`), `host`, `rule`, `actor`, `q` (text in rule, title, command, host, program), `limit` (default 500, max 5000) |
-| GET | `/api/events?…` | the event journal, newest first. Any event field is a filter (`type=alert`, `host=web-01`, `rule=CRED-001`, `pid=4242`), plus `q` (substring), `since` / `until` (ISO-8601, compared as text) and `limit` (default 500). Searches the in-memory index: the newest 50,000 security records and the newest 50,000 telemetry records ([operations.md](operations.md#retention-and-capacity)). AI job records are not included |
+| GET | `/api/events?…` | the event journal, newest first. Any event field is a filter (`type=alert`, `host=web-01`, `rule=CRED-001`, `pid=4242`), plus `q` (substring), `since` / `until` (ISO-8601, compared as text) and `limit` (default 500). Each record carries `rx_ts`, the time the console received it; `since` / `until` compare the sensor's event time. Searches the in-memory index: the newest 50,000 security records and the newest 50,000 telemetry records ([operations.md](operations.md#retention-and-capacity)). AI job records are not included |
 | GET | `/api/vulns` | vulnerability findings: `host`, `ecosystem`, `name`, `version`, `cve`, `severity`, `cvss`, `tier` (`exploited`, `reachable`, `dormant`, `theoretical`), `note`; most urgent first |
 | GET | `/api/posture` | `{"fleet_score", "fleet_grade", "hosts": [{host, score, grade, trust, mode, vulns, unsanctioned_tooling, anomalies, alerts_by_severity, findings}]}`, weakest first |
 | GET | `/api/inventory?host=` | latest 1000 inventory records (`kind`, `name`, `version`, `where`, `change`) |
@@ -72,7 +72,7 @@ See [analysis.md](analysis.md) for how incidents are scored and what each sugges
 | GET | `/api/incidents/detail?id=` | one incident plus `alerts`, the full `ai` record and its `suggestions` |
 | GET | `/api/analysis/health` | `{"status": "ok"\|"attention"\|"critical", "hosts_live", "sensors_connected", "findings": [{id, severity, category, title, detail, hosts}]}` |
 | GET | `/api/analysis/rules` | per rule: `alerts`, `open`, `acknowledged`, `resolved`, `benign`, `hosts`, `programs`, `assessment` (`ok`, `noisy`, `ready_to_enforce`), `advice`, `ai` |
-| GET | `/api/suggestions?status=` | suggestions, newest first: `id`, `kind`, `title`, `rationale`, `severity`, `source` (`analysis` or `ai`), `status` (`proposed`, `applying`, `applied`, `accepted`, `failed`, `rejected`, `expired`, `interrupted`), `action`, `required_role` (the role needed to decide it), `can_approve` (whether **your** token may decide it), `evidence`, `decided_by`, `decided_at`, `result`. Default: waiting for approval; `all` for everything |
+| GET | `/api/suggestions?status=` | suggestions, newest first: `id`, `kind`, `title`, `rationale`, `severity`, `source` (`analysis` or `ai`), `status` (`proposed`, `applying`, `applied`, `accepted`, `failed`, `rejected`, `expired`, `interrupted`), `action`, `required_role` (the role needed to decide it), `can_approve` (whether **your** token may decide it), `evidence`, `decided_by`, `decided_at`, `result`. A curation suggestion that would weaken detection has `action.weakens` (the reason) and says so in its title. Default: waiting for approval; `all` for everything. Paged with `limit` (default 500, max 1000) and `offset`; the body is still an array, with `X-Total-Count` and, while more remain, `X-Next-Offset` response headers. Bad values return `400` |
 | GET | `/api/ai/status` | `{"enabled", "reason", "model", "effort", "queued", "used_this_hour", "max_per_hour"}`. `reason` says why the assistant is off (no key, unreadable key or CA file, `-ai=false` …) |
 
 ### Deploy (deployer and above)
@@ -88,12 +88,12 @@ See [analysis.md](analysis.md) for how incidents are scored and what each sugges
 |---|---|---|
 | POST | `/api/alerts/triage` | body `{"id", "status": "open"\|"acknowledged"\|"resolved", "note"}`; returns the updated alert. Recorded with the caller's name |
 | POST | `/api/suggestions/decide` | body `{"id", "decision": "approve"\|"reject", "note"}`. Approving carries the action out; returns the suggestion with its `status` and `result`. A rollout suggestion from the analysis engine needs deployer, every other action operator, and any AI-sourced suggestion (`source: "ai"`) at least operator. `403` names the role needed |
-| POST | `/api/incidents/triage` | body `{"id", "status", "note"}`: triage every alert in the incident; returns `{"updated"}` |
+| POST | `/api/incidents/triage` | body `{"id", "status", "note", "alert_ids"}`. With `alert_ids` (the alerts you were shown) only those are triaged; alerts that joined the incident since are left alone and counted in `skipped`. `409` when none of the ids still belong to it (the incident changed: reload it). Without `alert_ids`, every alert in the incident. Returns `{"incident", "status", "updated", "skipped"}` |
 | POST | `/api/analysis/run` | run the analysis now; returns `{"proposed"}` (new suggestions) |
 | POST | `/api/ai/triage` | body `{"incident"}`. Queues an AI triage; returns the job (`202`). `503` when the assistant is off, `429` when busy or over the hourly cap |
 | POST | `/api/ai/curate` | body `{"rule"}`: AI review of one rule |
 | POST | `/api/ai/ask` | body `{"question"}` (max 2000 characters): AI answer using read-only tools |
-| GET | `/api/ai/jobs[?id=]` | AI jobs (newest 50), or one: `status` (`queued`, `running`, `done`, `failed`), `question` (as typed), `result`, `error`, `usage` |
+| GET | `/api/ai/jobs[?id=]` | AI jobs (newest 50), or one: `status` (`queued`, `running`, `done`, `failed`), `question` (redacted, as journaled), `result`, `error`, `usage` |
 | POST | `/api/policy/push?host=&action=` | push `enforce`, `monitor` or `reload` to one host. Returns `{"host", "action", "delivered"}` |
 | GET | `/api/vault` | `{"keys": [...]}`: secret names |
 | GET | `/api/vault?key=` | `{"key", "value"}`. Every read raises a `VAULT-ACCESS` audit alert with the reader's name |
@@ -172,7 +172,8 @@ host unless explicitly allowed (`allow_plaintext_token=True`,
 
 `mcp/wisp_mcp.py` is a stdio MCP server (stdlib only) with read-only tools:
 `wisp_fleet`, `wisp_alerts` (default 50, max 500), `wisp_vulns`,
-`wisp_incidents`, `wisp_incident`, `wisp_fleet_health`, `wisp_suggestions` and
+`wisp_incidents`, `wisp_incident`, `wisp_fleet_health`, `wisp_suggestions`
+(`status: "all"` pages with `limit`, default 100, and `offset`) and
 `wisp_check_package`. It has no approve tool, by design: a coding agent can
 see what is suggested but cannot sign off on it. Because an agent can usually
 read the server's token from its own MCP configuration, give it a **viewer**

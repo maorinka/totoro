@@ -269,7 +269,9 @@ TOOLS = [
     {"name": "wisp_fleet_health", "description": "Fleet health findings: sensors over CPU budget, silent hosts, version drift, weak identities, unprotected hosts, alert spikes.",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "wisp_suggestions", "description": "Remediations the console proposes and their status. Approval needs a human in the console; this server cannot approve anything.",
-     "inputSchema": {"type": "object", "properties": {"status": {"type": "string", "enum": ["", "all"]}}}},
+     "inputSchema": {"type": "object", "properties": {"status": {"type": "string", "enum": ["", "all"]},
+                                                      "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
+                                                      "offset": {"type": "integer", "minimum": 0}}}},
     {"name": "wisp_check_package",
      "description": "Before installing a dependency, check it against the curated catalog and the vulnerability "
                     "database for that exact version. Returns verdict allow / deny / unknown with reasons. "
@@ -466,6 +468,16 @@ def _str_arg(args, k, required=False):
     return v
 
 
+def _int_arg(args, k, default, lo, hi):
+    v = args.get(k)
+    if v is None:
+        return default
+    if isinstance(v, bool) or not isinstance(v, int) or v < lo or (hi is not None and v > hi):
+        bound = f"{lo}..{hi}" if hi is not None else f">= {lo}"
+        raise BadArgs(f"argument '{k}' must be an integer {bound}")
+    return v
+
+
 def call_tool(name, args):
     if name == "wisp_fleet":
         return api("/api/hosts")
@@ -488,7 +500,14 @@ def call_tool(name, args):
     if name == "wisp_fleet_health":
         return api("/api/analysis/health")
     if name == "wisp_suggestions":
-        return api("/api/suggestions" + ("?status=all" if args.get("status") == "all" else ""))
+        # The console pages /api/suggestions (limit default 500, max 1000);
+        # "all" includes decided history, so page it explicitly.
+        q = {}
+        if args.get("status") == "all":
+            q["status"] = "all"
+            q["limit"] = _int_arg(args, "limit", 100, 1, 1000)
+            q["offset"] = _int_arg(args, "offset", 0, 0, None)
+        return api("/api/suggestions" + (f"?{urllib.parse.urlencode(q)}" if q else ""))
     if name == "wisp_check_package":
         return check_package(_str_arg(args, "ecosystem", True), _str_arg(args, "name", True),
                              _str_arg(args, "version"))

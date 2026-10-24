@@ -79,7 +79,7 @@ The console keeps bounded windows in memory, and its journal on disk:
 | Alerts in the live view | newest 5,000, and at most about 64 MiB (over that, the heaviest host's oldest go first) |
 | Inventory records | newest 5,000, same byte bound |
 | Journal events indexed for search (Investigate, `/api/events`) | newest 50,000 security records (alerts, triage, rollouts, suggestions, audit) and, separately, newest 50,000 telemetry records (hellos, inventory, flows), each at most about 128 MiB |
-| Journal on disk | rotates at `-journal-max-mb` (256 MiB); one previous segment kept |
+| Journal on disk | rotates at `-journal-max-mb` (256 MiB); one previous segment kept. Each new segment starts with the analysis holds and the latest rollout per group carried forward, so they survive rotation; quiet hosts' last hello is not carried, so a host silent for longer than two segments drops out of replay |
 
 Older history stays in the journal files until the next rotation, but is no
 longer searchable from the console; read `events.jsonl` / `events.jsonl.1`

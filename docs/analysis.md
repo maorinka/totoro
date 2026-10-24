@@ -248,8 +248,8 @@ with who asked, the kind and target, the model, token usage, and the result
 (the model's answer, which can quote the redacted data) or the error. For Ask
 the journaled question is redacted. The prompts themselves are not
 journaled. `ai_result` records are not searchable from Investigate. The
-operator-only `/api/ai/jobs` keeps the latest 200 jobs in memory, with the
-question as typed.
+operator-only `/api/ai/jobs` keeps the latest 200 jobs in memory and shows
+the question redacted, as journaled.
 
 How the provider handles the data, including retention and use, is governed
 by your agreement with Anthropic (or with the operator of `-ai-url`). For a
