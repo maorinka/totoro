@@ -43,7 +43,7 @@ wispd -c /etc/wisp/wisp.conf --check-config
 |---|---|
 | `id` | any short identifier, shown in alerts (`CRED-001`) |
 | `severity` | `info`, `low`, `medium`, `high`, `critical` |
-| `action` | `ignore` (match and stop: an allow-list entry), `alert`, `kill` (terminate the process), `quarantine` (kill, and move the executable to `state_dir/quarantine`) |
+| `action` | `ignore` (match and stop: an allow-list entry), `alert`, `kill` (terminate the process and its descendants), `quarantine` (kill, and move the executable to `state_dir/quarantine`; system and shared files are never moved, see [troubleshooting.md](troubleshooting.md#an-enforced-quarantine-left-the-file-in-place)) |
 | `mitre` | ATT&CK technique ID, or `-` |
 | `title` | quoted, shown in the console |
 | `mode=` | optional per-rule override of the host's mode |
@@ -64,8 +64,8 @@ A leading `!` negates the condition.
 |---|---|
 | `exe` | the executable's path |
 | `cmd` | the full command line |
-| `comm` | the program name |
-| `pcomm` | the parent's program name |
+| `comm` | the program name, as the kernel records it: at most 15 characters, so an exact `comm=` on a longer name never matches (use `comm^=` or `exe`) |
+| `pcomm` | the parent's program name (same 15-character limit) |
 | `actor` | who is behind the process: `human`, `ai`, `code`, `ci`, `service`, `unknown` |
 | `src` | the actor's source, e.g. `claude`, `cursor`, `sshd`, `github-runner` |
 | `uid` | numeric user id |
@@ -98,7 +98,9 @@ RSHELL-01 critical kill T1059.004 "Shell spawned with network redirection" cmd*=
 
 The shipped `rules.conf` covers credential theft, reverse shells,
 living-off-the-land, persistence, privilege escalation, risky package
-installs and AI-agent activity. Start from it.
+installs and AI-agent activity. Start from it. (Since 1.1.0 `LOL-002` fires
+when a crontab is installed from the shell, `comm=crontab "!cmd$= -l"`, and
+not on `crontab -l`.)
 
 ## Catalog
 
@@ -135,6 +137,9 @@ ai claude allow
 ai cursor allow
 ```
 
+In the shipped `catalog.conf` the TypeScript pin is commented out, as an
+example.
+
 ## Network policy
 
 `netpolicy.conf` governs outbound TCP connections, attributed to the same
@@ -166,11 +171,18 @@ allow 10.0.0.0/8:any                # internal network is fine
 deny  any:any           actor=ai    # default-deny egress for AI agents
 ```
 
+The shipped `netpolicy.conf` has no active rules (everything is allowed and
+recorded); its examples are commented out. Enable rules deliberately, after
+tuning in monitor mode. In enforce mode, a kill that fails (for example
+because the PID was reused) is reported as `block-failed`.
+
 ## File integrity
 
 `fim.conf` lists paths to watch, one per line, with an optional severity
 (`critical`, `high` or `medium`; the default is `high`). Changes to a watched
 file, or to anything directly inside a watched directory, raise a `FIM` alert.
+The file must exist: `--check-config` fails without it, and its summary lists
+configured paths that do not exist yet.
 
 ```
 /etc/passwd           critical
@@ -190,5 +202,5 @@ Some alerts come from the sensor itself rather than `rules.conf`:
 | `NET-RATE` | a process exceeds a `limit` rule |
 | `FIM` | a watched file changes |
 | `ANOM-001` | a program runs that this host has never run before (after `anomaly_learn`) |
-| `HOST-ID-MISMATCH` | (console) a hostname reconnects with a different hardware/platform identity |
+| `HOST-ID-MISMATCH` | (console) a hostname reconnects with a different hardware/platform identity or a different client certificate (including an accepted renewal) |
 | `VAULT-ACCESS` | (console, info) a vault secret was read |

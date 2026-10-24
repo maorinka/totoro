@@ -17,6 +17,7 @@ Tokens are issued with `wisp-console -gen-token <role>:<name>` (see
 
 | Status | Meaning |
 |---|---|
+| `400` | malformed request: an encoded `/` (`%2F`) or a control character in the path, query parameters that are not UTF-8, or a bad body |
 | `401` | no token, or the token is not recognised |
 | `403` | the token's role is too low for this endpoint |
 | `405` | wrong method. State changes are `POST` only, so a link or prefetch can never trigger one |
@@ -25,7 +26,15 @@ Tokens are issued with `wisp-console -gen-token <role>:<name>` (see
 | `431` | request headers over 64 KiB |
 | `501` | chunked request bodies (`Transfer-Encoding`); send `Content-Length` |
 
-Errors are JSON: `{"error": "…"}`.
+Errors are JSON: `{"error": "…"}`. Authenticated responses carry
+`X-Wisp-Role` and `X-Wisp-User`. Every response, errors included, carries
+`Content-Security-Policy`, `X-Frame-Options: DENY`,
+`X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`,
+`Cross-Origin-Opener-Policy: same-origin`, and `Strict-Transport-Security`
+when served over HTTPS. A `HEAD` request gets the headers without a body, for
+errors too. Each client address may hold at most 64 of the 1,024 HTTP
+connections (see `-http-local-proxy` in
+[configuration.md](configuration.md#network)).
 
 ## Endpoints
 
@@ -41,17 +50,17 @@ Errors are JSON: `{"error": "…"}`.
 
 | Method | Path | Returns |
 |---|---|---|
-| GET | `/api/me` | `{"role", "name"}` of the caller |
+| GET | `/api/me` | `{"role", "name"}` of the caller. Use it to check a token's role (the MCP server does, at startup) |
 | GET | `/api/version` | `{"version", "runtime", "uptime_s", "auth"}`. `runtime` names the build, e.g. `C++ / OpenSSL 3.0.13 30 Jan 2024` |
-| GET | `/api/summary` | everything on the Overview page: host counts by state and group, open alerts by severity, alerts per hour (24 values, oldest first), top rules, vulnerabilities by tier, fleet posture, sensor CPU (max, average, budget, hosts over budget), recent rollouts |
+| GET | `/api/summary` | everything on the Overview page: host counts by state and group, open alerts by severity, alerts per hour (24 values, oldest first), top rules, vulnerabilities by tier, fleet posture, sensor CPU (max, average, budget, hosts over budget), recent rollouts, and `incidents_open`: `{"total", "by_priority": {"P1", "P2", "P3", "P4"}}`, every incident not resolved, uncapped |
 | GET | `/api/hosts?state=&group=` | hosts. `state`: `active`, `stale`, `decommissioned`, `all`; default is the live fleet (everything not decommissioned) |
 | GET | `/api/hosts/detail?name=` | one host: record, posture with findings, its latest 100 alerts, current software inventory |
 | GET | `/api/alerts?…` | alerts, newest first. Filters: `severity` (minimum: `low` … `critical`), `status` (`open`, `acknowledged`, `resolved`, `all`), `host`, `rule`, `actor`, `q` (text in rule, title, command, host, program), `limit` (default 500, max 5000) |
-| GET | `/api/events?…` | the event journal, newest first. Any event field is a filter (`type=alert`, `host=web-01`, `rule=CRED-001`, `pid=4242`), plus `q` (substring), `since` / `until` (ISO-8601, compared as text) and `limit` (default 500) |
+| GET | `/api/events?…` | the event journal, newest first. Any event field is a filter (`type=alert`, `host=web-01`, `rule=CRED-001`, `pid=4242`), plus `q` (substring), `since` / `until` (ISO-8601, compared as text) and `limit` (default 500). Searches the in-memory index: the newest 50,000 security records and the newest 50,000 telemetry records ([operations.md](operations.md#retention-and-capacity)). AI job records are not included |
 | GET | `/api/vulns` | vulnerability findings: `host`, `ecosystem`, `name`, `version`, `cve`, `severity`, `cvss`, `tier` (`exploited`, `reachable`, `dormant`, `theoretical`), `note`; most urgent first |
 | GET | `/api/posture` | `{"fleet_score", "fleet_grade", "hosts": [{host, score, grade, trust, mode, vulns, unsanctioned_tooling, anomalies, alerts_by_severity, findings}]}`, weakest first |
 | GET | `/api/inventory?host=` | latest 1000 inventory records (`kind`, `name`, `version`, `where`, `change`) |
-| GET | `/api/policy/rollout` | rollout history, newest first: `ts`, `by`, `action`, `group`, `percent`, `cohort`, `delivered`, `failed` |
+| GET | `/api/policy/rollout` | rollout history, newest first: `id`, `ts`, `by`, `action`, `group`, `percent`, `cohort`, `delivered`, `failed`, `send_failed` (the failed hosts whose connection broke during the write), `status` (`complete`, or `interrupted` when the console stopped mid-rollout). `delivered` means written to a host heard from within `-stale-after`, not applied |
 
 ### Analysis (viewer and above)
 
@@ -63,27 +72,28 @@ See [analysis.md](analysis.md) for how incidents are scored and what each sugges
 | GET | `/api/incidents/detail?id=` | one incident plus `alerts`, the full `ai` record and its `suggestions` |
 | GET | `/api/analysis/health` | `{"status": "ok"\|"attention"\|"critical", "hosts_live", "sensors_connected", "findings": [{id, severity, category, title, detail, hosts}]}` |
 | GET | `/api/analysis/rules` | per rule: `alerts`, `open`, `acknowledged`, `resolved`, `benign`, `hosts`, `programs`, `assessment` (`ok`, `noisy`, `ready_to_enforce`), `advice`, `ai` |
-| GET | `/api/suggestions?status=` | suggestions, newest first: `id`, `kind`, `title`, `rationale`, `severity`, `source` (`analysis` or `ai`), `status` (`proposed`, `applied`, `accepted`, `failed`, `rejected`, `expired`), `action`, `required_role`, `evidence`, `decided_by`, `decided_at`, `result`. Default: waiting for approval; `all` for everything |
-| GET | `/api/ai/status` | `{"enabled", "reason", "model", "effort", "queued", "used_this_hour", "max_per_hour"}` |
+| GET | `/api/suggestions?status=` | suggestions, newest first: `id`, `kind`, `title`, `rationale`, `severity`, `source` (`analysis` or `ai`), `status` (`proposed`, `applying`, `applied`, `accepted`, `failed`, `rejected`, `expired`, `interrupted`), `action`, `required_role` (the role needed to decide it), `can_approve` (whether **your** token may decide it), `evidence`, `decided_by`, `decided_at`, `result`. Default: waiting for approval; `all` for everything |
+| GET | `/api/ai/status` | `{"enabled", "reason", "model", "effort", "queued", "used_this_hour", "max_per_hour"}`. `reason` says why the assistant is off (no key, unreadable key or CA file, `-ai=false` …) |
 
 ### Deploy (deployer and above)
 
 | Method | Path | Does |
 |---|---|---|
 | POST | `/api/policy/rollout?action=&group=&percent=` | push `action` (`enforce`, `monitor`, `reload`) to `percent`% (1–100) of `group` (all groups if empty). Each host has a fixed position in the order, so a larger percentage is always a superset of a smaller one. Returns the rollout record |
+| POST | `/api/suggestions/decide` | decide a rollout suggestion from the analysis engine (body and rules under Operate, below) |
 
 ### Operate (operator and above)
 
 | Method | Path | Does |
 |---|---|---|
 | POST | `/api/alerts/triage` | body `{"id", "status": "open"\|"acknowledged"\|"resolved", "note"}`; returns the updated alert. Recorded with the caller's name |
-| POST | `/api/suggestions/decide` | body `{"id", "decision": "approve"\|"reject", "note"}`. Approving carries the action out; returns the suggestion with its `status` and `result`. A rollout suggestion needs deployer, everything else operator |
+| POST | `/api/suggestions/decide` | body `{"id", "decision": "approve"\|"reject", "note"}`. Approving carries the action out; returns the suggestion with its `status` and `result`. A rollout suggestion from the analysis engine needs deployer, every other action operator, and any AI-sourced suggestion (`source: "ai"`) at least operator. `403` names the role needed |
 | POST | `/api/incidents/triage` | body `{"id", "status", "note"}`: triage every alert in the incident; returns `{"updated"}` |
 | POST | `/api/analysis/run` | run the analysis now; returns `{"proposed"}` (new suggestions) |
 | POST | `/api/ai/triage` | body `{"incident"}`. Queues an AI triage; returns the job (`202`). `503` when the assistant is off, `429` when busy or over the hourly cap |
 | POST | `/api/ai/curate` | body `{"rule"}`: AI review of one rule |
 | POST | `/api/ai/ask` | body `{"question"}` (max 2000 characters): AI answer using read-only tools |
-| GET | `/api/ai/jobs[?id=]` | AI jobs (newest 50), or one: `status` (`queued`, `running`, `done`, `failed`), `result`, `error`, `usage` |
+| GET | `/api/ai/jobs[?id=]` | AI jobs (newest 50), or one: `status` (`queued`, `running`, `done`, `failed`), `question` (as typed), `result`, `error`, `usage` |
 | POST | `/api/policy/push?host=&action=` | push `enforce`, `monitor` or `reload` to one host. Returns `{"host", "action", "delivered"}` |
 | GET | `/api/vault` | `{"keys": [...]}`: secret names |
 | GET | `/api/vault?key=` | `{"key", "value"}`. Every read raises a `VAULT-ACCESS` audit alert with the reader's name |
@@ -114,22 +124,77 @@ curl -s -H "$H" -X POST "$C/api/policy/rollout?action=enforce&group=prod-web&per
 curl -s -H "$H" -X POST "$C/api/policy/rollout?action=enforce&group=prod-web&percent=100"
 ```
 
-With the SDKs:
+With the SDKs. Never approve suggestions in bulk: AI-sourced ones are built
+from telemetry an attacker can shape, and rollouts change fleet policy, so
+leave both to a person in the console and approve the rest one at a time
+after someone has read them:
 
 ```python
 from wisp import Wisp
-w = Wisp("https://console.corp:8080", token=OPERATOR_TOKEN)
+w = Wisp("https://console.corp:8080", token=OPERATOR_TOKEN, cafile="/etc/wisp/ca.pem")
 for inc in w.incidents(priority="P1"):
     print(inc["id"], inc["host"], inc["summary"])
     print(w.ai_triage(inc["id"])["verdict"])       # waits for the job
-for s in w.suggestions():
-    print(s["title"], s["required_role"])
-w.decide(s["id"], approve=True, note="contain now")
+
+for s in w.suggestions():                          # waiting for approval
+    if s["source"] == "ai" or s["action"].get("type") == "rollout":
+        print("review in the console:", s["id"], s["title"])
+        continue
+    print(s["id"], s["title"], s["rationale"], s["evidence"])
+    if input(f"approve {s['id']}? [y/N] ").strip().lower() == "y":
+        w.decide(s["id"], approve=True, note="reviewed by <name>")
 ```
 
-The MCP server adds read-only `wisp_incidents`, `wisp_incident`,
-`wisp_fleet_health` and `wisp_suggestions` tools. It has no approve tool, by
-design: a coding agent can see what is suggested but cannot sign off on it.
+```ts
+import { Wisp } from "./wisp";
+const w = new Wisp("https://console.corp:8080", OPERATOR_TOKEN);
+for (const s of await w.suggestions()) {
+  if (s.source === "ai" || s.action["type"] === "rollout") { console.log("review in console:", s.id, s.title); continue; }
+  console.log(s.id, s.title, s.rationale, s.evidence);
+  if (reviewed.has(s.id)) await w.decide(s.id, true, "reviewed by <name>");  // ids a person confirmed
+}
+```
+
+TLS is always verified. For a console with a private CA:
+
+| Client | Private CA | Turn verification off (throwaway dev setups only) |
+|---|---|---|
+| Python SDK | `cafile=` or `context=` | `insecure_skip_tls_verify=True` (`verify=False` is a deprecated spelling) |
+| Python CLI (`python3 sdk/wisp.py`) | `--ca` or `WISP_CA` | `--insecure-skip-tls-verify` |
+| TypeScript SDK | `NODE_EXTRA_CA_CERTS=/path/ca.pem`, or a `fetch` bound to your own undici dispatcher | never set `NODE_TLS_REJECT_UNAUTHORIZED=0` |
+| MCP server | `WISP_CA` | `WISP_INSECURE_SKIP_TLS_VERIFY=1` |
+
+All of them refuse to send the token over plain `http://` to a non-loopback
+host unless explicitly allowed (`allow_plaintext_token=True`,
+`{ allowPlaintextToken: true }`, `WISP_ALLOW_PLAINTEXT_TOKEN=1`).
+
+### MCP server
+
+`mcp/wisp_mcp.py` is a stdio MCP server (stdlib only) with read-only tools:
+`wisp_fleet`, `wisp_alerts` (default 50, max 500), `wisp_vulns`,
+`wisp_incidents`, `wisp_incident`, `wisp_fleet_health`, `wisp_suggestions` and
+`wisp_check_package`. It has no approve tool, by design: a coding agent can
+see what is suggested but cannot sign off on it. Because an agent can usually
+read the server's token from its own MCP configuration, give it a **viewer**
+token:
+
+```bash
+wisp-console -gen-token viewer:mcp
+```
+
+```json
+{ "mcpServers": { "wisp": { "command": "python3", "args": ["mcp/wisp_mcp.py"],
+    "env": { "WISP_URL": "https://console:8080", "WISP_TOKEN": "<viewer token>", "WISP_CA": "/etc/wisp/ca.pem" } } } }
+```
+
+The server asks `/api/me` for its token's role at startup and refuses to start
+unless it is `viewer`, and re-checks `X-Wisp-Role` on every response.
+`WISP_MCP_ALLOW_PRIVILEGED_TOKEN=1` overrides this with a warning; never set it
+where an agent runs. Tool output is redacted and wrapped in a `<fleet_data>`
+envelope marked untrusted. `wisp_check_package` reads the catalog and
+vulnerability database locally (`WISP_CATALOG`, `WISP_VULNDB`; keep them in
+step with the console) and answers `allow`, `deny` or `unknown`; treat
+`unknown` (a source could not be read) as not approved.
 
 ## Sensor wire protocol
 

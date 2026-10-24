@@ -12,13 +12,14 @@ Your token decides what you can do:
 | Role | Can |
 |---|---|
 | **viewer** | see everything |
-| **deployer** | + run staged rollouts |
-| **operator** | + triage alerts, push policy to a single host, read vault secrets |
+| **deployer** | + run staged rollouts, approve rollout suggestions from the analysis engine |
+| **operator** | + triage alerts, push policy to a single host, approve every other suggestion (and every AI suggestion, rollouts included), ask the AI assistant, read vault secrets |
 | **admin** | + write vault secrets |
 
 "Keep me signed in on this device" stores the token in the browser's local
-storage. Otherwise it is forgotten when the tab closes. Sign out from
-**Settings**.
+storage. Otherwise it is forgotten when the tab closes. If the browser blocks
+storage, the token is kept in memory only, for as long as the page is open.
+Sign out from **Settings**.
 
 ## Overview
 
@@ -36,8 +37,10 @@ The starting page answers "is anything wrong right now?":
   *reachable* tiers.
 - **Alerts per hour** for the last 24 hours. Hover a column for its exact
   count, or open **Show as table** for every value.
-- **Open incidents** with P1 and P2 counts, the **top incidents**, and
-  **suggested next steps** with the fleet health status.
+- **Open incidents** with P1 and P2 counts (exact, from `/api/summary`;
+  an older console shows "500+" past 500), the **top incidents**, and
+  **suggested next steps** with the fleet health status. AI suggestions are
+  labelled as such.
 - **Top detections**, **open high-severity alerts** (click one to open it)
   and **recent rollouts**.
 
@@ -69,9 +72,18 @@ follows:
   `rules.conf` or upgrading a package, and shows you the exact change.
 - **Reject** keeps it out of the inbox for a week.
 
-Buttons are disabled when your role is too low. **Decided** shows the history:
-who decided, when, and the outcome. **Analyze now** runs the analysis without
-waiting for the next minute.
+Who can decide a suggestion: a rollout from the analysis engine needs
+**deployer**, every other action **operator**, and any suggestion that came
+from the AI assistant at least **operator**. The buttons follow the console's
+own answer for each suggestion (`can_approve`); a disabled button names the
+role it needs and yours. AI suggestions are labelled **AI suggestion — review
+before approving** on the card, in the confirmation dialog, on the Overview
+and in the history: they are built from telemetry an attacker can influence.
+
+**Decided** shows the history: who decided, when, and the outcome
+(`applied`, `accepted`, `failed`, `rejected`, `expired`, or `interrupted` when
+the console stopped while carrying it out). **Analyze now** runs the analysis
+without waiting for the next minute.
 
 ## Analysis
 
@@ -136,9 +148,15 @@ use a [rollout](#rollouts).
 ![Investigate](images/investigate.png)
 
 Searches the console's event journal: alerts, inventory changes, sensor
-connects and exits, decommissioning, triage and rollouts. It goes back as far
-as the journal's retention. Combine text, event type, host, rule, actor,
-process ID and a time range. Expand any result for the raw event.
+connects and exits, decommissioning, triage and rollouts. It searches the
+in-memory index, which holds the newest 50,000 security records (alerts,
+triage, rollouts, suggestions) and the newest 50,000 telemetry records
+(connects, inventory); older events are only in the journal files (see
+[operations.md](operations.md#retention-and-capacity)). Combine text, event
+type, host, rule, actor, process ID and a time range. The From/To fields are in
+your local time (the page address keeps UTC). Expand any result for the raw
+event. A search is a point-in-time query: this page does not refresh on its
+own, so run the search again for new results.
 
 The console stores alerts and changes, not every process execution. For a
 complete record of everything one host executed or connected to, run on that
@@ -197,14 +215,17 @@ Everyone can see the history.
 ![Rollout confirmation](images/rollout-confirm.png)
 
 Every stage is recorded with who started it. "Delivered" means the command
-reached the sensor. Confirm the new mode in the **Mode** column on the Hosts
-page.
+was written to a live connection from a host heard from within `-stale-after`;
+a stale host is reported as not delivered. It does not mean the sensor has
+applied it: confirm the new mode in the **Mode** column on the Hosts page.
 
 ## Settings
 
 Your account and role, theme (system, light or dark), how often data
 refreshes, the AI assistant's status and usage, the console's version and
-uptime, and links to the health endpoints.
+uptime, and links to the health endpoints. A refresh keeps your paging,
+keyboard focus and open table panels, and waits while you are selecting text
+or editing a field.
 
 ## Keyboard
 

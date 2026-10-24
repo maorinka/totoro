@@ -1,6 +1,10 @@
 # Wisp performance — methodology and honest numbers
 
-Target: **< 0.05% of one CPU core.** All numbers are from the development host:
+Target: **< 0.05% of one CPU core** for the sensor's userspace process
+(`wispd`). The eBPF program's in-kernel cost is charged by the kernel to the
+processes that exec, not to `wispd`; `make verify` measures it separately
+(`kernel.bpf_stats_enabled`) and prints it as `INFO`, outside the budget. All
+numbers are from the development host:
 a **Firecracker/KVM microVM**, 4 vCPU, kernel 6.18 (virtualization inflates
 every figure; bare metal is ~10× cheaper — discussed below).
 
@@ -16,13 +20,16 @@ Wisp resolves this with a **CPU self-governor** (`governor.c`) that treats
 
 1. **Telemetry** (per-exec logging — the most expensive, least critical output)
    is suppressed over budget, restored under it.
-2. **In-kernel sampling of proven-benign churn** (budget-first mode): if the
+2. **In-kernel sampling of proven-benign repeats** (budget-first mode): if the
    pipeline is still over budget, the governor raises an eBPF sampling divisor.
-   Crucially, sampling applies **only to program paths userspace has already
-   seen execute many times with no alert** (the `benign` BPF map, maintained by
-   a frequency filter). Every **novel, rare, or ever-alerted** path is always
-   forwarded and fully evaluated, regardless of load. So shedding CPU drops only
-   repetitive known-good churn — never a new or suspicious exec.
+   Sampling applies **only to exact repeats of an exec context** (program path,
+   full argv, uid, tty, parent and grandparent comm, hashed in-kernel with a
+   secret key) that userspace has already evaluated many times with no alert
+   (the `benign` BPF map, maintained by a frequency filter). Every exec whose
+   context differs in any byte, or that has ever alerted, is always forwarded
+   and fully evaluated, regardless of load. What sampling can miss is a repeat
+   that a rule would judge differently only because of its inherited actor
+   (the same command and parents, now under an AI agent).
 
    Verified: under a 3,000 exec/s storm of benign churn with sampling active
    (1-in-4), **all 20 malicious marker execs were caught (20/20)** while the
@@ -31,10 +38,20 @@ Wisp resolves this with a **CPU self-governor** (`governor.c`) that treats
 
 | mode | guarantee | trade-off |
 |---|---|---|
-| **budget-first** (default) | **CPU < budget at any rate**; novel/rare/ever-alerted execs always evaluated | samples *proven-benign* churn sooner under load |
-| security-first | **CPU < budget at any rate**; keeps full coverage as long as possible | holds off sampling until at the cap, then samples proven-benign churn |
+| **budget-first** (default) | **CPU < budget against storms of repeated execs**; every exec with a new context always evaluated | samples *proven-benign* repeats sooner under load |
+| security-first | the same; keeps full coverage as long as possible | holds off sampling until at the cap, then samples proven-benign repeats |
 
-**The CPU cap is unconditional:** both modes hold it, and a config that sets `cpu_budget` to 0 or above 0.05 is clamped to 0.05 at load — there is no configuration of the product that runs the sensor uncapped. Verified: security-first at 500/s (0.0351%) and 1000/s (0.0365%), and a `cpu_budget=0` config at 300/s (0.0353%), all PASS.
+**The limit of the guarantee:** a storm of *distinct* command lines has nothing
+proven benign to sample, so it is evaluated in full and the sensor can exceed
+the budget for its duration. That is visible in the heartbeat (`cpu_pct`,
+`sample_n`, `sampled_drops`) and logged. The storms measured here (loops,
+polling scripts, identical build steps) are repeats.
+
+**No configuration runs the sensor uncapped:** a `cpu_budget` that is not a
+number in (0, 0.05] is rejected (`--check-config` fails) and the default 0.05
+is kept. Verified: security-first at 500/s (0.0351%) and 1000/s (0.0365%), and
+a `cpu_budget=0` config at 300/s (0.0353%, running on the default cap), all
+PASS.
 
 **At normal endpoint rates the two modes are identical** — nothing is sampled,
 full telemetry — because CPU is far under budget; sampling only engages during
@@ -107,15 +124,17 @@ harness inflated every figure ~2× by spawning a `sleep` exec per iteration).
 | 300 /s | 0.043 % ✅ | — |
 | 500 /s | ~0.065 % ❌ | — |
 
-Memory: **7 MB RSS** (1 MiB BPF ring buffer + libbpf). Binary ~885 KB.
-Runs as root confined to a capability bounding set: `CAP_BPF`/`CAP_PERFMON`
-(load+attach), `CAP_SYS_PTRACE` (ancestor lookup for attribution), `CAP_KILL`
-(enforce), `CAP_DAC_READ_SEARCH` (watching protected files); `CAP_SYS_ADMIN`
-only if tracefs must be auto-mounted.
+Memory: **7 MB RSS** (BPF ring buffer + libbpf). Binary ~885 KB.
+Runs as root confined to a capability set: `CAP_BPF`/`CAP_PERFMON`
+(load+attach), `CAP_SYS_PTRACE` (ancestor lookup for attribution, reaching a
+quarantined program through `/proc/<pid>/root`), `CAP_KILL` (enforce),
+`CAP_DAC_READ_SEARCH` (watching protected files), `CAP_DAC_OVERRIDE` and
+`CAP_FOWNER` (quarantine from user-owned and sticky directories).
 
 This table is the **raw** cost with the governor disabled. It was measured
 with a development build that still allowed `cpu_budget = 0`; since 1.0 the
-budget is unconditional (any value outside (0, 0.05] is clamped to 0.05), so
+budget is unconditional (any value outside (0, 0.05] is rejected and 0.05
+kept), so
 these raw rows document the pipeline's efficiency rather than a configuration
 you can run,
 to show the underlying efficiency. On this microVM the raw security pipeline
@@ -140,9 +159,9 @@ escaping fast-paths the clean-string case with one `memcpy`.
 
 ### 1. eBPF captures the event in-kernel at exec time
 
-The sensor is a tracepoint on `sys_enter_execve` (`agent/bpf/exec.bpf.c`) that
-captures pid, ppid, uid, filename and **argv** into a ring buffer **the instant
-exec happens**. Userspace drains the ring buffer. Because the data is already
+The sensor is a tracepoint on `sched/sched_process_exec`
+(`agent/bpf/exec.bpf.c`) that captures pid, ppid, uid, filename and **argv**
+into a ring buffer **the moment the exec succeeds**. Userspace drains the ring buffer. Because the data is already
 captured in the kernel, userspace can drain it **lazily and in batches** without
 ever racing a process that has since exited.
 
@@ -184,8 +203,9 @@ immediately (0 added latency). Measured worst case (marker exec fired inside an
 active window, 200 ms window): **175 ms**, bounded by `coalesce_ms`. Enforcement
 (kill) still fires within the window; verified killing a marker process.
 
-`coalesce_ms` is configurable. The default is 500 ms (clear budget margin on
-this microVM). On bare metal, where a wakeup is ~5–15 µs instead of ~130 µs, a
+`coalesce_ms` is configurable. The shipped `wisp.conf` sets 500 ms (clear
+budget margin on this microVM); the built-in default, when a config omits it,
+is 0 (no coalescing). The governor runs on the exec path either way. On bare metal, where a wakeup is ~5–15 µs instead of ~130 µs, a
 much smaller window — or none — meets the budget at far higher rates, so the
 latency can be dropped accordingly.
 
@@ -200,6 +220,10 @@ makes is the measured one: **< 0.05% at idle and at realistic sustained
 endpoint load (to ~200 exec/s) on this microVM, with 100% event capture.**
 
 ## Reproducing
+
+On a disposable test machine only (`make verify` / `bench/verify.sh` runs
+sensors in enforce mode and refuses to run where Wisp is installed unless
+given `--force`):
 
 ```bash
 make -C agent                       # builds the eBPF object + skeleton + wispd

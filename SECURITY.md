@@ -1,19 +1,13 @@
 # Security policy
 
-## Reporting a vulnerability
+## Research project
 
-Please report suspected vulnerabilities privately to the maintainers rather
-than in a public issue. Include the affected version (`wispd --version`,
-`wisp-console -version`), a description, and steps to reproduce. We aim to
-acknowledge reports within three working days.
+Wisp is a research project. It is not a supported product, has no security
+response process and no private reporting channel, and comes with no
+guarantee of fixes. Do not rely on it to protect production systems.
 
-## Supported versions
-
-| Version | Supported |
-|---|---|
-| 1.1.x | Yes |
-| 1.0.x | Yes |
-| 0.x | No |
+Issues, including security issues, can be opened on the repository; they are
+handled on a best-effort basis.
 
 ## Security model in brief
 

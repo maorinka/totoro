@@ -2,7 +2,7 @@
 
 ```
                   ┌──────────────── kernel ────────────────┐   ┌─────────── wispd (userspace) ──────────┐
-   exec happens → │ tracepoint sys_enter_execve (exec.bpf.c)│   │                                        │
+   exec happens → │ sched/sched_process_exec (exec.bpf.c)   │   │                                        │
                   │  capture pid/ppid/uid/comm/filename/argv│   │  proc_bpf.c    actor.c     rules.c      │
                   │            │                            │   │  drain ring ─▶ attribute ─▶ policy      │
                   │            ▼                            │   │  (batched)     human/ai     engine      │
@@ -27,7 +27,7 @@
 | Source | Kernel mechanism | Why it is cheap / correct |
 |---|---|---|
 | Outbound connections | **eBPF tracepoint** on `inet_sock_set_state` (→ `SYN_SENT`) → second ring buffer | attributed to the same actor model; network policy and rate limits evaluated in userspace |
-| Process exec (default) | **eBPF tracepoint** on `sys_enter_execve` → **ring buffer** | full event (incl. argv) captured in-kernel at exec time: no `/proc` read, and safe to drain in batches without racing short-lived processes |
+| Process exec (default) | **eBPF tracepoint** `sched/sched_process_exec` → **ring buffer** | full event (incl. argv, process and parent start times) captured in-kernel once the exec has succeeded: no `/proc` read, and safe to drain in batches without racing short-lived processes. A full ring is counted and logged |
 | Process exec (fallback) | netlink **proc connector** + classic-BPF socket filter | portable, no BPF/BTF needed; reads `/proc` per event, so cannot batch safely |
 | Package / extension installs | **inotify** on install dirs (`node_modules`, `.vscode/extensions`, …) | fires only on change; no tree walks on a timer |
 | File tampering | **inotify** on sensitive paths (`/etc/shadow`, `/etc/ssh`, …) | same |
@@ -74,29 +74,51 @@ flagged as **Shadow AI**.
 
 ## Response (`respond.c`)
 
-Userspace only: `SIGKILL` the process and its immediate children; quarantine a
-binary by moving it into a `0700` store with exec bits stripped (copy+unlink
-across filesystems). Nothing here touches the kernel or any OS integrity control
-— matching io.security's "EDR‑friendly, no kernel extensions" constraint.
+Userspace only. A kill freezes the process and every descendant with
+`SIGSTOP`, enumerates the tree, then `SIGKILL`s it; a pid is signalled only
+while its start time still matches the event (through a pidfd where
+available), so a reused pid is never hit. Workers that left the tree before the
+freeze are logged as escapees, not killed. Quarantine identifies the running
+program through `/proc/<pid>/exe` while the tree is frozen, reaches it through
+the process's own root (`/proc/<pid>/root`: containers, `PrivateTmp`), copies
+it into a `0700` store and unlinks the original after re-checking the inode.
+It refuses system and shared files (OS directories, dpkg-owned files, the
+sensor's own binary and loader, root's files in root-controlled directories,
+FUSE mounts) and then only kills, with `quarantine_error` in the alert.
+Nothing here touches the kernel or any OS integrity control — matching
+io.security's "EDR‑friendly, no kernel extensions" constraint.
 
 ## CPU self-governor (`governor.c`) + frequency filter
 
-The governor enforces `cpu_budget` as a hard SLA. Under load it re-evaluates
-every 250 ms while above 60% of the budget and every second otherwise (driven
-from the active drain path, so an idle host still has zero wakeups). It reads
-the agent's own CPU and sheds work cheapest-first: first it suppresses the per-exec
-telemetry *log* (no events lost); if the pipeline itself is still over budget
-(budget-first mode) it raises an eBPF sampling divisor.
+The governor enforces `cpu_budget` (the userspace sensor's own CPU) as a hard
+SLA. Under load it re-evaluates every 250 ms while above 60% of the budget and
+every second otherwise. It is driven from the exec-processing path, whether or
+not `coalesce_ms` is set, from a 1 s one-shot timer while it is shedding (so
+coverage comes back promptly after a storm), and from the housekeeping tick;
+an idle host still has zero wakeups. It sheds work cheapest-first: first it
+suppresses the per-exec telemetry *log* (no events lost); if the pipeline
+itself is still over budget (budget-first mode) it raises an eBPF sampling
+divisor.
 
-Sampling never drops security-relevant events. The eBPF program hashes each
-program path and samples **only** paths present in a `benign` map. Userspace
-maintains that map with a frequency filter (`proc_bpf.c`): a path seen executing
-`BENIGN_PROMOTE` times with no alert is published as benign; a path that ever
-alerts is pinned out of it permanently. So under an exec storm the kernel sheds
-only repetitive proven-benign churn (`/usr/bin/cc` in a build loop, say) while
-every novel, rare, or previously-alerting path is always forwarded and
-evaluated. This is what lets the hard CPU cap coexist with not missing new or
-suspicious activity.
+Sampling is limited to exact repeats of proven-benign exec contexts. The eBPF
+program hashes each exec's whole context (program path, full argv, uid, tty,
+parent and grandparent comm) with a SipHash key drawn at random when the sensor starts, so a crafted
+command line cannot collide with a benign one, and samples **only** keys
+present in a `benign` map. Userspace maintains that map with a frequency
+filter (`proc_bpf.c`): a context evaluated `BENIGN_PROMOTE` (12) times with no
+alert is published as benign; a context that alerts, or whose argv was cut or
+that ran from a file descriptor, is never promoted in that generation. The
+whole set expires on every policy reload and every 30 minutes. So under an
+exec storm the kernel sheds only exact repeats (`cc` with the same arguments
+in a build loop, say), while every exec that differs in any byte is forwarded
+and evaluated.
+
+Limits: a sampled repeat that a rule would treat differently only because of
+its inherited actor (the same command and parents, now under an AI agent) can
+be missed; a storm of distinct command lines cannot be sampled, so it is
+evaluated in full and the sensor may exceed the budget for its duration
+(visible in the heartbeat as `cpu_pct`, `sample_n`, `sampled_drops`); and if
+the ring buffer fills, execs are lost and logged.
 
 ## Console link (`console.c`)
 
@@ -128,30 +150,45 @@ hash and three bit tests.
 ## Forensics (`forensics.c`)
 
 `wispd --search` runs as a separate short-lived process over the sensor's
-JSONL record, so the running sensor pays nothing. `tree=PID` first grows the
-descendant set from every record carrying `pid`/`ppid` (exec telemetry and
-alerts), then returns those processes' execs, alerts and network flows merged
-in time order.
+JSONL record (rotated and compressed segments included), so the running
+sensor pays nothing. `tree=PID` first grows the descendant set from every
+record carrying `pid`/`ppid` (exec telemetry and alerts), then returns those
+processes' execs, alerts and network flows merged in time order. Processes
+are identified by (boot, pid, start time) from the records' `boot`, `start`
+and `pstart` fields, so a reused pid never joins the wrong tree; when several
+processes held the pid, the newest is shown and the others listed, and
+`tree=PID:START[@BOOT]` picks one.
 
 ## Console (`console/`)
 
-- **Ingest** (`console.cpp`): one thread per sensor connection, 10 s TLS
-  handshake deadline, read deadline 10 minutes, 1 MiB line cap. Each connection speaks for one host, and writes
-  back to it are serialised by a per-connection lock. A connection must
-  say hello first and is then bound to that host. Sensor input is
-  sanitised of console-only fields before use.
+- **Ingest** (`console.cpp`): one thread per sensor connection (up to
+  `-max-sensors`), 10 s TLS handshake deadline, read deadline 10 minutes,
+  64 KiB line cap and per-connection rate limits. Each connection speaks for
+  one host, and writes back to it are serialised by a per-connection lock and
+  have a 5 s deadline. A connection must say hello first and is then bound to
+  that host and, through the client certificate's SHA-256 fingerprint, to the
+  certificate the host first used. Sensor input is sanitised of console-only
+  fields before use. A push counts as delivered only when the host has been
+  heard from within `-stale-after`.
 - **Journal** (`store.cpp`): every non-heartbeat event is appended to
-  `events.jsonl` and indexed in memory for search. At startup the journal
-  (rotated segment first) is replayed through the same `apply` path as live
-  ingest, rebuilding hosts, alerts with triage, inventory, lifecycle and
-  rollout history. The journal rotates by size.
+  `events.jsonl` and indexed in memory for search (two bounded windows:
+  security records and telemetry). At startup the journal (rotated segment
+  first) is replayed through the same `apply` path as live ingest, rebuilding
+  hosts, alerts with triage, inventory, lifecycle and rollout history. The
+  journal rotates by size. Each segment starts with a header giving its
+  format (3 in 1.1.0); rollout records over about 1 MiB are split into parts
+  and joined on replay, and an incomplete set replays as `interrupted`.
+  Journals from 1.0 (Go) and format 2 replay; `audit` and other console-only
+  record types found in sensor input are dropped.
 - **Lifecycle**: hosts are active, stale or decommissioned. Ephemeral hosts
   retire on goodbye or disconnect; a reaper retires silent persistent hosts.
 - **Rollouts**: each host's position in a group is `fnv32a(hostname) mod 100`,
   so a larger percentage is always a superset of a smaller one. The web UI
   uses the same hash to preview a stage exactly.
 - **HTTP** (`http.cpp`, `console.cpp`): an HTTP/1.1 server with keep-alive,
-  header/request/idle timeouts and a connection cap; routes, RBAC wrapper,
+  header/request/idle timeouts, a connection cap (1,024) and a per-client cap
+  (64; IPv6 per /64; loopback exempt only with `-http-local-proxy`); paths
+  with an encoded `/` are refused; routes, RBAC wrapper,
   method guards, security headers, body limit, access log, health and
   readiness, graceful shutdown. TLS (OpenSSL 3) lives in `net.cpp`. Read
   models, vulnerability tiers and posture live in `store.cpp`; the vault in
@@ -171,8 +208,11 @@ in time order.
   - One worker thread runs a bounded job queue.
   - Triage and rule review use structured outputs (JSON schema). Ask is a
     tool-use loop over ten read-only tools.
-  - Inputs are redacted. Outputs go back through `Analyst::propose`, which
-    validates them.
+  - Every string sent (fleet data, JSON keys, the question) is redacted,
+    capped at 4 KB, and escaped inside a `<fleet_data>` block; prompts and
+    tool results are size-bounded. See
+    [analysis.md](analysis.md#data-sent-to-the-claude-api).
+  - Outputs go back through `Analyst::propose`, which validates them.
   - Results are journaled as `ai_result` records.
 - **Web UI** (`web/`): plain HTML, CSS and JavaScript compiled into the
   binary by `tools/embed.cpp`. No framework and no network dependencies. DOM is built through
