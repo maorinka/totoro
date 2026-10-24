@@ -1118,7 +1118,7 @@ Suggestion Analyst::decide(const std::string &id, bool approve, const std::strin
 	return s;
 }
 
-json Analyst::suggestions_json(const std::string &status, size_t limit) {
+json Analyst::suggestions_json(const std::string &status, size_t limit, size_t offset, size_t *total) {
 	std::lock_guard lk(mu_);
 	// Newest first by proposal time (a reopened suggestion keeps its place in
 	// the history but is new again).
@@ -1130,12 +1130,11 @@ json Analyst::suggestions_json(const std::string &status, size_t limit) {
 		v.push_back(&*it);
 	}
 	std::stable_sort(v.begin(), v.end(), [](auto *a, auto *b) { return a->ts > b->ts; });
+	if (total)
+		*total = v.size();
 	json out = json::array();
-	for (auto *s : v) {
-		if (out.size() >= limit)
-			break;
-		out.push_back(suggestion_to_json(*s));
-	}
+	for (size_t i = offset; i < v.size() && out.size() < limit; i++)
+		out.push_back(suggestion_to_json(*v[i]));
 	return out;
 }
 

@@ -22,11 +22,12 @@ setups only: anyone on the network path can then steal the bearer token.
     # (s["source"] == "ai") are derived from endpoint telemetry, which an
     # attacker controls (prompt injection via command lines, file names...),
     # so a human must review each one in the console. The console refuses
-    # AI-sourced approvals without the deployer role. Rollouts change fleet
+    # AI-sourced approvals without the operator role. Rollouts change fleet
     # policy and also belong to a human. Below: only analysis-sourced,
     # non-rollout suggestions, and each one is shown and confirmed by a person.
     for s in w.suggestions():                # waiting for approval
-        if s["source"] == "ai" or s["action"].get("type") == "rollout":
+        if (s["source"] == "ai" or s["action"].get("type") == "rollout"
+                or s["action"].get("weakens") or not s.get("can_approve")):
             print("review in the console:", s["id"], s["title"])
             continue
         print(s["id"], s["title"], s["rationale"], s["evidence"])
@@ -50,7 +51,11 @@ import urllib.request
 
 
 class WispError(RuntimeError):
-    pass
+    """status: the HTTP status when the console answered with an error (else None)."""
+
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
 
 
 def _is_loopback(host: str) -> bool:
@@ -124,7 +129,7 @@ class Wisp:
                 detail = e.read().decode(errors="replace")
             except Exception:
                 detail = ""
-            raise WispError(f"{e.code} {e.reason}: {detail}") from e
+            raise WispError(f"{e.code} {e.reason}: {detail}", status=e.code) from e
         except urllib.error.URLError as e:
             raise WispError(f"{method} {path}: {e.reason}") from e
         except (TimeoutError, socket.timeout, ssl.SSLError, OSError) as e:
@@ -166,9 +171,37 @@ class Wisp:
         """Per-rule volume, triage outcomes and assessment (noisy / ready_to_enforce)."""
         return self._get("/api/analysis/rules") or []
 
-    def suggestions(self, status: str = "") -> list:
-        """Suggestions; '' = waiting for approval, 'all' = everything."""
-        return self._get("/api/suggestions", status=status) or []
+    # Every status a suggestion can have. "applying": approved and being carried
+    # out; "interrupted": the console stopped before the outcome was recorded
+    # (check the target before acting again).
+    SUGGESTION_STATUSES = ("proposed", "applying", "applied", "accepted", "failed", "rejected", "expired",
+                           "interrupted")
+
+    def suggestions(self, status: str = "", limit: int | None = None, offset: int | None = None) -> list:
+        """One page of suggestions, newest first; status '' = waiting for approval
+        (proposed or applying), 'all' = everything, or one of SUGGESTION_STATUSES.
+        limit: 1..1000 (console default 500); offset: from 0.
+
+        Each has required_role (the role needed to decide it: deployer for an
+        engine rollout, else operator; at least operator when source == "ai"),
+        can_approve (whether this token's role may decide it), and, for a
+        curation change that would detect or stop less, action["weakens"]."""
+        return self._get("/api/suggestions", status=status,
+                         limit=None if limit is None else str(limit),
+                         offset=None if offset is None else str(offset)) or []
+
+    def all_suggestions(self, status: str = "all", page_size: int = 500) -> list:
+        """Every suggestion with that status, fetched a page at a time."""
+        out, seen, offset = [], set(), 0
+        while True:
+            page = self.suggestions(status, limit=page_size, offset=offset)
+            for s in page:
+                if s["id"] not in seen:
+                    seen.add(s["id"])
+                    out.append(s)
+            if len(page) < page_size:
+                return out
+            offset += page_size
 
     # --- decisions (operator+; deployer for rollout suggestions) ---
     def decide(self, suggestion_id: str, approve: bool, note: str = "") -> dict:
@@ -178,13 +211,23 @@ class Wisp:
         suggestion before approval, above all AI-sourced ones (source == "ai"):
         they are derived from attacker-controllable endpoint telemetry and may
         be the product of prompt injection. The console refuses AI-sourced
-        approvals without the deployer role."""
+        approvals without the operator role."""
         return self._req("POST", "/api/suggestions/decide",
                          {"id": suggestion_id, "decision": "approve" if approve else "reject", "note": note})
 
-    def triage_incident(self, incident_id: str, status: str, note: str = "") -> dict:
-        """Set every alert in an incident to open | acknowledged | resolved."""
-        return self._req("POST", "/api/incidents/triage", {"id": incident_id, "status": status, "note": note})
+    def triage_incident(self, incident_id: str, status: str, note: str = "",
+                        alert_ids: list[str] | None = None) -> dict:
+        """Set the alerts of an incident to open | acknowledged | resolved.
+
+        Pass alert_ids, the alerts a person reviewed (e.g. [a["id"] for a in
+        incident(id)["alerts"]]): alerts that joined the incident since are left
+        alone and counted in "skipped", and when none of them is in it any more
+        the console answers 409 (WispError.status == 409: reload and review again). Without
+        alert_ids every alert is triaged. Returns {incident, status, updated, skipped}."""
+        body = {"id": incident_id, "status": status, "note": note}
+        if alert_ids is not None:
+            body["alert_ids"] = list(alert_ids)
+        return self._req("POST", "/api/incidents/triage", body)
 
     # --- AI assistant (operator+; the console must have an API key) ---
     def _ai(self, kind: str, body: dict, timeout: float) -> dict:

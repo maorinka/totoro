@@ -807,6 +807,30 @@ TEST(AiAskRunsReadOnlyToolsAndReturnsThinkingUnchanged) {
 	CHECK_EQ(body_json(e.areq("GET", "/api/ai/jobs", TOK_OPERATOR)).size(), (size_t)1);
 }
 
+TEST(AiJobsShowTheQuestionRedactedLikeTheJournal) {
+	MockApi m;
+	AnEnv e;
+	m.handler = [&](const json &, int) {
+		return MockApi::Reply{200, api_message({{{"type", "text"}, {"text", "ok"}}})};
+	};
+	e.ai = std::make_unique<Assistant>(e.st, e.an, test_ai(m));
+	const std::string secret = "Zq8xK2mN7vR4tY9wB3cL6pD1";
+	const std::string q = "why did curl -H 'Authorization: Bearer " + secret + "' fail? password=" + secret;
+	CHECK(redact(q).find(secret) == std::string::npos);
+	auto sub = e.ai->submit("ask", q, "olive");
+	CHECK_EQ(sub["question"], redact(q));
+	auto job = wait_job(*e.ai, sub["id"]);
+	CHECK_EQ(job["question"], redact(q));
+	auto list = body_json(e.areq("GET", "/api/ai/jobs", TOK_OPERATOR));
+	CHECK(list.size() == 1 && list[0]["question"] == redact(q));
+	auto one = e.areq("GET", "/api/ai/jobs?id=" + sub["id"].get<std::string>(), TOK_OPERATOR);
+	CHECK(one.body.find(secret) == std::string::npos && list.dump().find(secret) == std::string::npos);
+	std::ifstream jf(e.st.journal_path());  // nor does the journal
+	std::stringstream ss;
+	ss << jf.rdbuf();
+	CHECK(ss.str().find(secret) == std::string::npos);
+}
+
 TEST(AiErrorsRetriesRefusalsAndLimits) {
 	MockApi m;
 	AnEnv e;
@@ -1624,4 +1648,174 @@ TEST(AiSuggestionsNeedAnOperatorToApprove) {
 	CHECK(denied);
 	CHECK_EQ(r.an.suggestion(id)->status, "proposed");
 	CHECK_EQ(r.an.decide(id, false, "olive", "operator", "").status, "rejected");
+}
+
+// ---- integration: triage what was shown, paginated suggestions, rotation --------------------
+
+TEST(IncidentTriageRouteTriagesOnlyTheAlertsShown) {
+	AnEnv e;
+	e.send(alert("h1", "CRED-001", "high", minutes(20), "ai", "claude", 100, 1));
+	e.send(alert("h1", "AI-003", "high", minutes(19), "ai", "claude", 101, 1));
+	auto inc = e.for_host("h1").at(0);
+	e.send(alert("h1", "PERSIST-02", "medium", minutes(18), "ai", "claude", 102, 1));  // joins after it was shown
+	auto post = [&](const json &b) { return e.areq("POST", "/api/incidents/triage", TOK_OPERATOR, b.dump()); };
+	auto r = post({{"id", inc.id}, {"status", "acknowledged"}, {"note", "looking"}, {"alert_ids", inc.alert_ids}});
+	CHECK_EQ(r.status, 200);
+	CHECK_EQ(body_json(r)["updated"].get<int>(), 2);
+	CHECK_EQ(body_json(r)["skipped"].get<int>(), 1);
+	CHECK_EQ(e.for_host("h1").at(0).status, "open");  // the late alert is still open
+	// None of what was shown is in the incident: nothing changes, 409.
+	r = post({{"id", inc.id}, {"status", "resolved"}, {"alert_ids", {"A-not-in-it"}}});
+	CHECK_EQ(r.status, 409);
+	CHECK(body_json(r)["error"].get<std::string>().find("changed") != std::string::npos);
+	CHECK_EQ(body_json(r)["skipped"].get<int>(), 3);
+	CHECK_EQ(e.for_host("h1").at(0).status, "open");
+	CHECK_EQ(post({{"id", inc.id}, {"status", "resolved"}, {"alert_ids", "x"}}).status, 400);
+	CHECK_EQ(post({{"id", inc.id}, {"status", "resolved"}, {"alert_ids", json::array()}}).status, 400);
+	CHECK_EQ(post({{"id", inc.id}, {"status", "resolved"}, {"alert_ids", {1, 2}}}).status, 400);
+	// Without alert_ids (older clients) every alert is triaged.
+	r = post({{"id", inc.id}, {"status", "resolved"}});
+	CHECK(r.status == 200 && body_json(r)["updated"].get<int>() == 3);
+	CHECK_EQ(e.for_host("h1").at(0).status, "resolved");
+}
+
+TEST(SuggestionHistoryIsPaginated) {
+	AnEnv e;
+	for (int i = 0; i < 5; i++) {
+		Suggestion s;
+		s.kind = "x";
+		s.title = "t" + std::to_string(i);
+		s.key = "k" + std::to_string(i);
+		s.action = {{"type", "manual"}, {"instructions", "x"}};
+		e.an.propose(s);
+	}
+	auto page = [&](const std::string &q, Response *out = nullptr) {
+		auto r = e.areq("GET", "/api/suggestions?" + q, TOK_VIEWER);
+		if (out)
+			*out = r;
+		return r.status == 200 ? body_json(r) : json();
+	};
+	Response r;
+	auto p1 = page("status=all&limit=2", &r);
+	CHECK_EQ(p1.size(), (size_t)2);
+	CHECK_EQ(r.get("X-Total-Count"), "5");
+	CHECK_EQ(r.get("X-Next-Offset"), "2");
+	auto p2 = page("status=all&limit=2&offset=2"), p3 = page("status=all&limit=2&offset=4", &r);
+	CHECK(p2.size() == 2 && p3.size() == 1);
+	CHECK_EQ(r.get("X-Next-Offset"), "");
+	std::set<std::string> ids;
+	for (auto *p : {&p1, &p2, &p3})
+		for (auto &j : *p) {
+			ids.insert(j["id"].get<std::string>());
+			CHECK(j["can_approve"] == false);  // a viewer decides nothing
+			CHECK_EQ(j["required_role"], "operator");
+		}
+	CHECK_EQ(ids.size(), (size_t)5);
+	CHECK_EQ(page("status=all").size(), (size_t)5);  // the default page holds them all
+	CHECK_EQ(page("status=all&offset=9").size(), (size_t)0);
+	for (std::string bad : {"limit=0", "limit=1001", "limit=-1", "offset=-3", "limit=abc"}) {
+		page("status=all&" + bad, &r);
+		CHECK_EQ(r.status, 400);
+	}
+}
+
+TEST(HeartbeatsMoveTheGenerationOnlyWhenTheyChangeSomething) {
+	AnEnv e;
+	e.connect("c-1", "g", "monitor");
+	auto gen = e.st.generation();
+	for (int i = 0; i < 5; i++)
+		e.heartbeat("c-1", "monitor", 0.01 * i);
+	CHECK_EQ(e.st.generation(), gen);
+	e.heartbeat("c-1", "enforce");
+	CHECK(e.st.generation() > gen);
+}
+
+TEST(RotationCarriesAnalysisHoldsAndLatestRollouts) {
+	TempDir d;
+	std::string path = d.path + "/events.jsonl", rejected, prod_latest, dev_latest, prod_first;
+	auto wire = [](Store &st, Analyst &an) {
+		st.replay_hook = [&an](const json &r) { an.replay(r); };
+		st.carry_hook = [&an] { return an.carry_forward(); };
+	};
+	{
+		Store st;
+		Analyst an(st);
+		wire(st, an);
+		st.journal_max = 4096;
+		st.open_journal(path);
+		for (auto [h, g] : {std::pair{"web-1", "prod"}, std::pair{"dev-1", "dev"}}) {
+			std::string raw = json{{"type", "hello"}, {"host", h}, {"group", g}, {"host_id", std::string("i-") + h}}.dump();
+			st.ingest(event_from_json(json::parse(raw)), raw);
+		}
+		prod_first = st.rollout("monitor", "prod", 100, "dee").id;
+		prod_latest = st.rollout("enforce", "prod", 100, "dee").id;
+		dev_latest = st.rollout("enforce", "dev", 100, "dee").id;
+		Suggestion s;
+		s.kind = "x";
+		s.title = "rotate the key";
+		s.key = "hold-me";
+		s.action = {{"type", "manual"}, {"instructions", "x"}};
+		rejected = an.propose(s).id;
+		an.decide(rejected, false, "olive", "operator", "not now");
+		// Many rotations: the segments that recorded all of the above are gone.
+		for (int i = 0; i < 200; i++) {
+			std::string raw = json{{"ts", now_ts()}, {"type", "alert"}, {"host", "h"}, {"rule", "R"},
+			                       {"severity", "low"}, {"title", std::string(100, 'x')}}
+			                      .dump();
+			st.ingest(event_from_json(json::parse(raw)), raw);
+		}
+		CHECK_EQ(st.rollouts_json().size(), (size_t)3);
+		st.close_journal();
+	}
+	std::ifstream old(path + ".1");
+	std::stringstream ss;
+	ss << old.rdbuf();
+	CHECK(ss.str().find(prod_first) == std::string::npos);  // rotated away for good
+	Store st;
+	Analyst an(st);
+	wire(st, an);
+	st.open_journal(path);
+	auto sg = an.suggestion(rejected);
+	CHECK(sg.has_value() && sg->status == "rejected");
+	CHECK_EQ(an.suggestions_json("all").size(), (size_t)1);
+	auto ro = st.rollouts_json();
+	std::map<std::string, int> seen;
+	for (auto &r : ro)
+		seen[r["id"].get<std::string>()]++;
+	CHECK(seen.size() == 2 && seen[prod_latest] == 1 && seen[dev_latest] == 1);
+	CHECK(!seen.count(prod_first));
+	st.close_journal();
+}
+
+TEST(RolloutsInJournalOrderAndReceiptTimes) {
+	TempDir d;
+	std::string err;
+	auto ro = [](const std::string &id, const std::string &ts) {
+		return json{{"ts", ts}, {"type", "rollout"}, {"src", "console"}, {"id", id}, {"action", "enforce"},
+		            {"group", "g"}, {"percent", 10}, {"by", "dee"}}
+		    .dump() +
+		       "\n";
+	};
+	// The second record has an older timestamp (a clock step): journal order wins.
+	write_file_atomic(d.path + "/events.jsonl",
+	                  journal_header() + ro("RO1-1", "2026-05-02T00:00:00.000Z") + ro("RO1-2", "2026-05-01T00:00:00.000Z") +
+	                      ro("RO1-1", "2026-05-02T00:00:00.000Z"),  // carried copy: same rollout
+	                  0600, &err);
+	Store st;
+	st.open_journal(d.path + "/events.jsonl");
+	auto list = st.rollouts_json();
+	CHECK(list.size() == 2 && list[0]["id"] == "RO1-2" && list[1]["id"] == "RO1-1");
+	// A sensor whose clock is three days behind: still an alert of the last 24 hours.
+	std::string raw = json{{"ts", ago(minutes(3 * 24 * 60))}, {"type", "alert"}, {"host", "h"}, {"rule", "R"},
+	                       {"severity", "low"}}
+	                      .dump();
+	st.ingest(event_from_json(json::parse(raw)), raw);
+	CHECK_EQ(st.summary()["alerts"]["last_24h"].get<int>(), 1);
+	// Every searchable record carries the console's receipt time.
+	auto ev = st.search_events({});
+	CHECK(ev.size() >= 3);
+	for (auto &r : ev)
+		CHECK(r.contains("rx_ts") && r["rx_ts"].is_string());
+	CHECK(ev[0]["type"] == "alert" && ev[0]["rx_ts"] != ev[0]["ts"]);
+	st.close_journal();
 }

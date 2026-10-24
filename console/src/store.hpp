@@ -261,6 +261,12 @@ public:
 	// them from segments this version wrote.
 	void record_console(json j);
 	std::function<void(const json &)> replay_hook;
+	// Called when the journal rotates, with the store lock held: the console
+	// records (suggestion, suggestion_decision, ...) that must outlive the
+	// segment that held them (Analyst::carry_forward). They are re-journaled
+	// at the top of the new segment, with the latest rollout of each group.
+	// The hook must not call into the Store.
+	std::function<std::vector<json>()> carry_hook;
 	static bool console_record_type(const std::string &type);
 
 	// consistent copies for the analysis engine
@@ -268,7 +274,9 @@ public:
 	std::vector<Host> hosts_copy();  // with state filled in
 	std::vector<Rollout> rollouts_copy();
 
-	// Changes whenever anything a read model depends on changes.
+	// Changes whenever anything incident correlation depends on changes
+	// (alerts, triage, hosts, inventory, rollouts; a heartbeat only when it
+	// changes a host's mode or group).
 	unsigned long long generation() const { return generation_.load(std::memory_order_acquire); }
 
 	// introspection for tests
@@ -314,8 +322,9 @@ private:
 	bool record_parts(Event ev, bool sync);
 	bool cert_ok(const LiveLink &l, const Host &h) const;
 	bool admit_host(const Event &e, const SensorSession &s);
-	void index_event(const std::string &raw);
+	void index_event(const std::string &raw, bool trusted = true);
 	void rotate();
+	void carry_forward();  // after a rotation: re-journal what must outlive the old segment
 	int open_segment(std::string *err, long long *size);
 	void decommission(Host &h, const std::string &reason);
 	void lifecycle_record(Host &h, const std::string &change, const std::string &reason);
@@ -347,6 +356,8 @@ private:
 	std::string journal_path_;
 	long long journal_size_ = 0;
 	bool journal_closed_ = false, rotate_pending_ = false, need_newline_ = false;
+	bool carrying_ = false;          // carry_forward() is writing: no rotation, no re-indexing
+	long long carried_bytes_ = 0;    // carried records at the top of this segment (not counted toward journal_max)
 	std::chrono::steady_clock::time_point rotate_retry_at_{}, error_logged_{}, rotate_logged_{};
 	JournalHealth health_;
 	std::string write_error_, rotate_error_;

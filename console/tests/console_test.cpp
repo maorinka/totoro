@@ -2158,11 +2158,11 @@ TEST(DecideRouteUsesEachSuggestionsRole) {
 	Suggestion s;
 	s.source = "ai";
 	s.action = manual;
-	CHECK_EQ(decide_role(s), std::string("operator"));
+	CHECK_EQ(approval_role(s), std::string("operator"));
 	s.action = rollout;
-	CHECK_EQ(decide_role(s), std::string("operator"));
+	CHECK_EQ(approval_role(s), std::string("operator"));
 	s.source = "analysis";
-	CHECK_EQ(decide_role(s), std::string("deployer"));
+	CHECK_EQ(approval_role(s), std::string("deployer"));
 	CHECK_EQ(req(TOK_DEPLOYER, {{"id", ai}, {"decision", "approve"}}).status, 403);
 	CHECK_EQ(req(TOK_DEPLOYER, {{"id", ro}, {"decision", "approve"}}).status, 403);
 	CHECK_EQ(an.suggestion(ro)->status, std::string("proposed"));

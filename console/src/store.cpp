@@ -267,7 +267,7 @@ void Store::open_journal(const std::string &path) {
 				at = parse_ts(e.rx_ts);
 			else if (at = parse_ts(e.ts); !is_zero(at) && at > mtime)
 				at = mtime;
-			index_event(line);
+			index_event(line, trusted);
 			apply(e, at, true);
 			n++;
 		}
@@ -316,6 +316,7 @@ void Store::open_journal(const std::string &path) {
 		throw std::runtime_error("journal " + path + ": " + err);
 	journal_fd_ = fd;
 	journal_size_ = size;
+	carried_bytes_ = 0;
 	health_ = JournalHealth{};
 	write_error_.clear();
 	rotate_error_.clear();
@@ -438,7 +439,68 @@ void Store::rotate() {
 	rotate_pending_ = false;
 	rotate_error_.clear();
 	need_newline_ = false;
+	carried_bytes_ = 0;
 	logf("journal: rotated at %lld MiB", journal_max >> 20);
+	carry_forward();
+}
+
+// The segment that just became .1 is dropped at the next rotation: what must
+// outlive it is written again at the top of the new one. Replay treats the
+// copies as the same records (same ids), so carrying twice changes nothing.
+void Store::carry_forward() {
+	carrying_ = true;
+	long long start = journal_size_;
+	size_t rollouts = 0, records = 0;
+	// The latest rollout of each group (journal order), so the rollout history
+	// keeps where every group stands. Interrupted ones stay interrupted.
+	std::map<std::string, const Rollout *> latest;
+	for (auto &r : rollouts_)
+		if (!r.id.empty())
+			latest[r.group] = &r;
+	std::vector<const Rollout *> carry;
+	for (auto &[_, r] : latest)
+		carry.push_back(r);
+	std::sort(carry.begin(), carry.end());  // rollouts_ order (pointers into one vector)
+	for (auto *r : carry) {
+		Event ev;
+		ev.ts = fmt_ts_ms(r->ts);
+		ev.type = r->status == "interrupted" ? "rollout_intent" : "rollout";
+		ev.id = r->id;
+		ev.action = r->action;
+		ev.group = r->group;
+		ev.percent = r->percent;
+		ev.cohort = r->cohort;
+		ev.by = r->by;
+		ev.src = "console";
+		if (ev.type == "rollout") {
+			ev.delivered = r->delivered;
+			ev.failed = r->failed;
+			ev.send_failed = r->send_failed;
+		}
+		rollouts += record_parts(ev, false);
+	}
+	if (carry_hook) {
+		std::vector<json> recs;
+		try {
+			recs = carry_hook();
+		} catch (const std::exception &e) {
+			logf("journal: could not collect analysis state to carry forward: %s", e.what());
+		}
+		for (auto &j : recs) {
+			if (!j.is_object())
+				continue;
+			if (!j.contains("ts"))
+				j["ts"] = now_ts();
+			j["src"] = "console";
+			records += record(journal_line(j));
+		}
+	}
+	if (journal_fd_ >= 0)
+		(void)fdatasync(journal_fd_);
+	carried_bytes_ = journal_size_ - start;
+	carrying_ = false;
+	if (rollouts || records)
+		logf("journal: carried %zu rollout(s) and %zu analysis record(s) into the new segment", rollouts, records);
 }
 
 // Search-index classes: security records keep their own window so bulk
@@ -452,7 +514,7 @@ static bool security_record(const std::string &type, const json &m) {
 	       type == "suggestion" || type == "suggestion_decision" || type == "audit";
 }
 
-void Store::index_event(const std::string &raw) {
+void Store::index_event(const std::string &raw, bool trusted) {
 	json m;
 	try {
 		m = json::parse(raw);
@@ -467,6 +529,18 @@ void Store::index_event(const std::string &raw) {
 	// (/api/ai/jobs), so not searchable by viewers through /api/events.
 	if (type == "ai_result" || type == "journal")
 		return;
+	// rx_ts is the console's receipt time on every record: stamped on sensor
+	// lines at ingest, and the console's own ts for what it wrote. In a
+	// segment from an older console a sensor could have supplied it: dropped.
+	if (!trusted) {
+		m.erase("rx_ts");
+		m.erase("src");
+	}
+	auto src = m.find("src");
+	bool console_written = type == "triage" || type == "rollout" || type == "rollout_intent" || type == "lifecycle" ||
+	                       type == "audit" || (src != m.end() && *src == "console");
+	if (console_written && !m.contains("rx_ts") && m.contains("ts") && m["ts"].is_string())
+		m["rx_ts"] = m["ts"];
 	Window &w = security_record(type, m) ? security_ : telemetry_;
 	std::string ts = m.contains("ts") && m["ts"].is_string() ? m["ts"].get<std::string>() : "";
 	size_t cost = raw.size() * 3 + 256;  // the raw line plus its parsed DOM, roughly
@@ -525,10 +599,11 @@ bool Store::record(const std::string &raw, bool sync) {
 			if (sync)
 				(void)fdatasync(journal_fd_);
 		}
-		if (journal_max > 0 && (journal_size_ > journal_max || rotate_pending_))
+		if (journal_max > 0 && !carrying_ && (journal_size_ - carried_bytes_ > journal_max || rotate_pending_))
 			rotate();
 	}
-	index_event(raw);
+	if (!carrying_)  // carried records are already in the search index
+		index_event(raw);
 	return true;
 }
 
@@ -813,7 +888,10 @@ bool Store::inventory_update(const Event &e, bool replay) {
 }
 
 void Store::apply(const Event &e, TimePoint at, bool replay) {
-	bump();
+	// Heartbeats (every few seconds per host) only move the generation when
+	// they change what correlation reads (see the heartbeat branch below).
+	if (e.type != "heartbeat")
+		bump();
 	if (e.type == "triage") {
 		auto it = alert_by_id_.find(e.id);
 		if (it == alert_by_id_.end() && replay)
@@ -867,6 +945,15 @@ void Store::apply(const Event &e, TimePoint at, bool replay) {
 		}
 		if (!e.id.empty())
 			intents_.erase(e.id);
+		if (replay && !r.id.empty()) {
+			// Carried forward across a rotation (see carry_forward()): the same
+			// rollout again, in the place it first had.
+			auto same = std::find_if(rollouts_.begin(), rollouts_.end(), [&](const Rollout &x) { return x.id == r.id; });
+			if (same != rollouts_.end()) {
+				*same = std::move(r);
+				return;
+			}
+		}
 		rollouts_.push_back(std::move(r));
 		while (rollouts_.size() > max_rollouts)
 			rollouts_.erase(rollouts_.begin());
@@ -881,6 +968,10 @@ void Store::apply(const Event &e, TimePoint at, bool replay) {
 			add_alert(e, replay);
 		return;
 	}
+	std::optional<std::pair<std::string, std::string>> before;  // heartbeat: (group, mode) before it
+	if (e.type == "heartbeat")
+		if (auto it = hosts_.find(e.host); it != hosts_.end())
+			before.emplace(it->second.group, it->second.mode);
 	Host &h = host_ref(e.host, e.group, at, replay);
 	if (!replay)
 		h.last_contact = Mono::now();
@@ -931,6 +1022,8 @@ void Store::apply(const Event &e, TimePoint at, bool replay) {
 			h.mode = e.mode;
 		if (e.has_runtimes)
 			h.runtimes = e.runtimes;
+		if (!before || before->first != h.group || before->second != h.mode)
+			bump();
 	} else if (e.type == "alert") {
 		h.alerts++;
 		add_alert(e, replay);
@@ -1721,11 +1814,11 @@ json Store::posture_json() {
 
 json Store::rollouts_json() {
 	std::shared_lock lk(mu_);
-	std::vector<Rollout> out = rollouts_;
-	std::stable_sort(out.begin(), out.end(), [](const Rollout &a, const Rollout &b) { return a.ts > b.ts; });
+	// Newest first in journal order (the order they happened in on this
+	// console), not by timestamp: a wall-clock step must not reorder history.
 	json j = json::array();
-	for (auto &r : out)
-		j.push_back(rollout_to_json(r));
+	for (auto it = rollouts_.rbegin(); it != rollouts_.rend(); ++it)
+		j.push_back(rollout_to_json(*it));
 	return j;
 }
 
@@ -1776,7 +1869,9 @@ json Store::summary() {
 			open[a.severity] = open.value(a.severity, 0) + 1;
 			open_total++;
 		}
-		TimePoint t = parse_ts(a.ts);
+		// When the console received it: a sensor's clock (skewed, or forged)
+		// must not move alerts in or out of the last 24 hours.
+		TimePoint t = parse_ts(a.rx_ts.empty() ? a.ts : a.rx_ts);
 		if (t < day_ago)
 			continue;
 		last24++;

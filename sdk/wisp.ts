@@ -18,11 +18,11 @@
 //   // (source === "ai") are derived from endpoint telemetry an attacker
 //   // controls (prompt injection via command lines, file names, ...), so a
 //   // human must review each one in the console; the console refuses
-//   // AI-sourced approvals without the deployer role. Rollouts change fleet
+//   // AI-sourced approvals without the operator role. Rollouts change fleet
 //   // policy and also need a human. Only list the rest, and approve one at a
 //   // time after a person has read it (`reviewed` = ids a human confirmed):
 //   for (const s of await w.suggestions()) {
-//     if (s.source === "ai" || s.action["type"] === "rollout") { console.log("review in console:", s.id, s.title); continue; }
+//     if (s.source === "ai" || s.action.type === "rollout" || s.action.weakens || !s.can_approve) { console.log("review in console:", s.id, s.title); continue; }
 //     console.log(s.id, s.title, s.rationale, s.evidence);
 //     if (reviewed.has(s.id)) await w.decide(s.id, true, "reviewed by <name>");
 //   }
@@ -36,9 +36,21 @@ export interface Finding { host: string; ecosystem: string; name: string; versio
 export interface Incident { id: string; host: string; group: string; priority: "P1" | "P2" | "P3" | "P4"; score: number; severity: string; status: string;
   first_ts: string; last_ts: string; alert_count: number; rules: string[]; techniques: string[]; actors: string[]; campaign_hosts: string[];
   contained: boolean; summary: string; reasons: string[]; ai: { verdict: string; confidence: string; summary: string; ts: string } | null; }
+/** "applying": approved and being carried out; "interrupted": the console stopped before the outcome was recorded (check the target). */
+export type SuggestionStatus = "proposed" | "applying" | "applied" | "accepted" | "failed" | "rejected" | "expired" | "interrupted";
+/** What approving a suggestion does. `weakens` is set on a curation change that would detect or stop less. */
+export interface SuggestionAction { type?: "push" | "rollout" | "triage" | "manual" | string; weakens?: string; [k: string]: unknown; }
 export interface Suggestion { id: string; ts: string; kind: string; title: string; rationale: string; severity: string; source: "analysis" | "ai";
-  status: "proposed" | "applied" | "accepted" | "failed" | "rejected" | "expired"; action: Record<string, unknown>; required_role: string;
+  status: SuggestionStatus; action: SuggestionAction;
+  /** The role needed to approve or reject it: deployer for an engine rollout, else operator (always at least operator when source is "ai"). */
+  required_role: "operator" | "deployer" | string;
+  /** Whether the caller's role may decide it (from GET /api/suggestions). */
+  can_approve?: boolean;
   evidence: string[]; decided_by: string; decided_at: string; result: string; }
+/** Pagination for suggestions(): newest first; limit 1..1000 (console default 500), offset from 0. */
+export interface Page { limit?: number; offset?: number; }
+/** POST /api/incidents/triage. `skipped`: alerts that joined the incident after it was shown, left as they were. */
+export interface TriageResult { incident: string; status: string; updated: number; skipped: number; }
 /** The full AI triage journal record returned by /api/incidents/detail (the list form flattens it to Incident["ai"]). */
 export interface AiRecord { type: string; purpose: string; by: string; job: string; target: string; model: string;
   usage: Record<string, unknown>; result: { verdict?: string; confidence?: string; summary?: string; [k: string]: unknown }; ts: string; }
@@ -113,17 +125,39 @@ export class Wisp {
   incident(id: string) { return this.req<IncidentDetail>("GET", `/api/incidents/detail?id=${encodeURIComponent(id)}`); }
   health()     { return this.req<{ status: string; findings: any[] }>("GET", "/api/analysis/health"); }
   ruleReview() { return this.req<any[]>("GET", "/api/analysis/rules"); }
-  /** "" = waiting for approval, "all" = everything. */
-  suggestions(status = "") { return this.req<Suggestion[]>("GET", `/api/suggestions${status ? "?status=" + status : ""}`); }
+  /** "" = waiting for approval (proposed or applying), "all" = everything, or one status. Newest first, one page. */
+  suggestions(status: "" | "all" | SuggestionStatus = "", page: Page = {}) {
+    const q = new URLSearchParams();
+    if (status) q.set("status", status);
+    if (page.limit !== undefined) q.set("limit", String(page.limit));
+    if (page.offset !== undefined) q.set("offset", String(page.offset));
+    const qs = q.toString();
+    return this.req<Suggestion[]>("GET", `/api/suggestions${qs ? "?" + qs : ""}`);
+  }
+  /** Every suggestion with that status, fetched a page at a time (newest first). */
+  async allSuggestions(status: "" | "all" | SuggestionStatus = "all", pageSize = 500): Promise<Suggestion[]> {
+    const out: Suggestion[] = [];
+    const seen = new Set<string>();
+    for (let offset = 0; ; offset += pageSize) {
+      const got = await this.suggestions(status, { limit: pageSize, offset });
+      for (const s of got) if (!seen.has(s.id)) { seen.add(s.id); out.push(s); }
+      if (got.length < pageSize) return out;
+    }
+  }
   /** Approve (the console carries it out) or reject. Operator; deployer for rollouts.
    *  Never call this in a loop over suggestions(): a human must review each one,
    *  above all AI-sourced ones (source === "ai"), which come from attacker-controllable
-   *  telemetry. The console refuses AI-sourced approvals without the deployer role. */
+   *  telemetry. The console refuses AI-sourced approvals without the operator role. */
   decide(id: string, approve: boolean, note = "") {
     return this.req<Suggestion>("POST", "/api/suggestions/decide", { id, decision: approve ? "approve" : "reject", note });
   }
-  triageIncident(id: string, status: "open" | "acknowledged" | "resolved", note = "") {
-    return this.req<{ updated: number }>("POST", "/api/incidents/triage", { id, status, note });
+  /** Triage the alerts of an incident. Pass `alertIds`, the alerts a person reviewed (e.g. from incident(id).alerts):
+   *  alerts that joined since are left alone (counted in `skipped`), and when none of them is in the incident any
+   *  more the console answers 409 (WispError status 409: reload and review again). Without it, every alert is triaged. */
+  triageIncident(id: string, status: "open" | "acknowledged" | "resolved", note = "", alertIds?: string[]) {
+    const body: Record<string, unknown> = { id, status, note };
+    if (alertIds) body["alert_ids"] = alertIds;
+    return this.req<TriageResult>("POST", "/api/incidents/triage", body);
   }
 
   private async ai<T>(kind: string, body: unknown, timeoutMs: number): Promise<T> {

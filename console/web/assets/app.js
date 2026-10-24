@@ -458,6 +458,18 @@
   const aiBadge = (text = 'AI') => h('span', { class: 'badge ai', title: 'Proposed by the AI assistant' }, icon('i-spark', 'ic small'), text);
   const KIND = { contain: 'Contain', rollout: 'Gradual enforcement', tune_rule: 'Rule tuning', enforce_rule: 'Rule hardening', close_stale: 'Housekeeping',
     patch: 'Patch', ai_push: 'Policy push', ai_rollout: 'Rollout', ai_triage: 'Triage', ai_manual: 'Manual step', ai_rule: 'Rule change' };
+  // Every status a suggestion can have (analysis.cpp). "interrupted": the
+  // console stopped while carrying it out, so the outcome is unknown.
+  const SG_STATUS = { proposed: 'Waiting for approval', applying: 'Being carried out', applied: 'Applied', accepted: 'Accepted',
+    failed: 'Failed', rejected: 'Rejected', expired: 'Expired', interrupted: 'Interrupted' };
+  const sgStatus = (st) => SG_STATUS[st] || cap(st);
+  const SG_STATUS_CLASS = { applied: 'enforce', accepted: 'enforce', failed: 'bad', interrupted: 'warn', applying: 'busy' };
+  const sgStatusBadge = (st) => h('span', { class: 'badge ' + (SG_STATUS_CLASS[st] || ''), text: sgStatus(st) });
+  // A curation change that would detect or stop less (the console marks it
+  // in action.weakens): never let it pass as routine.
+  const weakensNote = (a) => (a && typeof a.weakens === 'string' && a.weakens
+    ? h('p', { class: 'weakens', role: 'note' }, icon('i-sev-high', 'ic small'), h('b', { text: 'Weakens detection' }), ' ', h('span', { text: a.weakens }))
+    : null);
 
   // Fetched fresh by every view that needs it (cheap); a failed fetch is
   // reported for that view only and never cached.
@@ -520,6 +532,8 @@
     const note = h('textarea', { 'aria-label': 'Note', placeholder: approve ? 'Note for the audit trail (optional)' : 'Why not? (optional, kept in the audit trail)' });
     const body = [];
     if (sg.source === 'ai') body.push(aiNotice());
+    const wk = weakensNote(sg.action);
+    if (wk) body.push(wk);
     body.push(h('p', { text: describeAction(sg.action) }));
     if (sg.action.type === 'manual') body.push(h('pre', { class: 'block', text: sg.action.instructions }));
     else if (approve) body.push(h('p', { class: 'muted', text: 'The console carries this out now and records it with your name.' }));
@@ -529,7 +543,7 @@
     if (!ok) return;
     try {
       const r = await api('/api/suggestions/decide', { method: 'POST', body: { id: sg.id, decision: approve ? 'approve' : 'reject', note: note.value } });
-      toast(r.status === 'failed' ? `Could not apply: ${r.result}` : `${cap(r.status)}: ${r.result}`, r.status === 'failed');
+      toast(r.status === 'failed' ? `Could not apply: ${r.result}` : `${sgStatus(r.status)}: ${r.result}`, r.status === 'failed');
       onDone && onDone();
     } catch (e) { toast(e.message, true); }
   }
@@ -546,21 +560,33 @@
     const ev = (sg.evidence || []).map((x) => x.startsWith('INC-')
       ? h('a', { href: '#', onclick: (e) => { e.preventDefault(); incidentDrawer(x, onDone); } }, 'incident')
       : x.startsWith('rule:') ? h('a', { href: '/analysis' }, x.slice(5)) : h('code', { text: x }));
-    return h('li', { class: 'sugg' + (isAi ? ' from-ai' : '') },
+    const weakens = sg.action && typeof sg.action.weakens === 'string' && sg.action.weakens;
+    let outcome;
+    if (sg.status === 'proposed') {
+      outcome = h('div', { class: 'row', style: { marginTop: '8px' } },
+        h('button', { class: 'btn small primary', type: 'button', disabled: !allowed, onclick: () => decide(sg, true, onDone) }, sg.action.type === 'manual' ? 'Accept' : 'Approve'),
+        h('button', { class: 'btn small', type: 'button', disabled: !allowed, onclick: () => decide(sg, false, onDone) }, 'Reject'),
+        !allowed ? h('span', { class: 'muted', text: sg.required_role ? `Needs the ${sg.required_role} role${isAi ? ' for AI suggestions' : ''}; you are signed in as ${me.role || 'unknown'}.` : 'Your role cannot decide this suggestion.' }) : null);
+    } else if (sg.status === 'applying') {
+      outcome = h('p', { class: 'muted', role: 'status' }, sgStatusBadge(sg.status), ` Approved by ${sg.decided_by || '–'} `, timeEl(sg.decided_at), '; the console is carrying it out now.');
+    } else if (sg.status === 'interrupted') {
+      outcome = h('p', { class: 'warn-text' }, sgStatusBadge(sg.status), ` Approved by ${sg.decided_by || '–'} `, timeEl(sg.decided_at),
+        ': the console stopped before the outcome was recorded. Check its target before acting again.');
+    } else {
+      outcome = h('p', { class: 'muted' }, sgStatusBadge(sg.status), ` by ${sg.decided_by || '–'} `, timeEl(sg.decided_at), sg.result ? [': ', h('span', { text: sg.result })] : '');
+    }
+    return h('li', { class: 'sugg' + (isAi ? ' from-ai' : '') + (weakens ? ' weakens-sugg' : '') },
       h('div', { class: 'row' }, sevChip(sg.severity), h('b', { class: 'grow', text: sg.title }), isAi ? aiBadge() : null,
+        weakens ? h('span', { class: 'badge weakens-badge', text: 'Weakens detection' }) : null,
         h('span', { class: 'badge', text: KIND[sg.kind] || sg.kind })),
+      weakensNote(sg.action),
       isAi && sg.status === 'proposed' ? aiNotice() : null,
       h('p', { class: 'muted', text: sg.rationale }),
       h('div', { class: 'row' }, h('span', { class: 'action-desc', text: describeAction(sg.action) }),
         ev.length ? h('span', { class: 'muted' }, 'Evidence: ', ...ev.flatMap((x, i) => (i ? [', ', x] : [x]))) : null,
         h('span', { class: 'muted' }, '· ', timeEl(sg.ts))),
       sg.action.type === 'manual' ? h('pre', { class: 'block', text: sg.action.instructions }) : null,
-      sg.status === 'proposed'
-        ? h('div', { class: 'row', style: { marginTop: '8px' } },
-          h('button', { class: 'btn small primary', type: 'button', disabled: !allowed, onclick: () => decide(sg, true, onDone) }, sg.action.type === 'manual' ? 'Accept' : 'Approve'),
-          h('button', { class: 'btn small', type: 'button', disabled: !allowed, onclick: () => decide(sg, false, onDone) }, 'Reject'),
-          !allowed ? h('span', { class: 'muted', text: sg.required_role ? `Needs the ${sg.required_role} role${isAi ? ' for AI suggestions' : ''}; you are signed in as ${me.role || 'unknown'}.` : 'Your role cannot decide this suggestion.' }) : null)
-        : h('p', { class: 'muted' }, `${cap(sg.status)} by ${sg.decided_by || '–'} `, timeEl(sg.decided_at), sg.result ? [': ', h('span', { text: sg.result })] : ''));
+      outcome);
   }
 
   function aiTriageView(ai) {
@@ -604,9 +630,18 @@
         const note = h('textarea', { 'aria-label': 'Triage note', placeholder: 'What did you find? Notes containing “benign” or “false positive” teach the rule review.' });
         const act = (status, label) => h('button', { class: 'btn small' + (status === 'resolved' ? ' primary' : ''), type: 'button', disabled: inc.status === status, onclick: async () => {
           try {
-            const r = await api('/api/incidents/triage', { method: 'POST', body: { id: inc.id, status, note: note.value } });
-            toast(`${r.updated} alert${r.updated === 1 ? '' : 's'} marked ${status}`); redraw();
-          } catch (e) { toast(e.message, true); }
+            // Only the alerts on screen: any that joined the incident since are
+            // left alone by the console (skipped), or refused with 409 when
+            // none of these are in it any more.
+            const r = await api('/api/incidents/triage', { method: 'POST', body: { id: inc.id, status, note: note.value, alert_ids: inc.alerts.map((a) => a.id) } });
+            const skipped = r.skipped || 0;
+            toast(`${r.updated} alert${r.updated === 1 ? '' : 's'} marked ${status}` +
+              (skipped ? `; ${skipped} newer alert${skipped === 1 ? '' : 's'} left as ${skipped === 1 ? 'it was' : 'they were'} (reloaded: review ${skipped === 1 ? 'it' : 'them'} too)` : ''));
+            redraw();
+          } catch (e) {
+            if (e.status === 409) { toast('This incident changed since you opened it, so nothing was changed. Reloaded: review it and triage again.', true); redraw(); }
+            else toast(e.message, true);
+          }
         } }, label);
         tri.append(note, h('div', { class: 'row', style: { marginTop: '8px' } }, act('acknowledged', 'Acknowledge all'), act('resolved', 'Resolve all'), act('open', 'Reopen')));
       } else tri.append(h('p', { class: 'muted', text: 'Triage requires the operator role.' }));
@@ -679,6 +714,8 @@
           h('div', { class: 'row', style: { marginBottom: '6px' } }, h('span', { class: 'muted', text: 'Fleet health:' }), h('a', { href: '/analysis', text: HL[hl.status] || hl.status }),
             hl.findings.length ? h('span', { class: 'muted', text: `· ${hl.findings.length} finding${hl.findings.length === 1 ? '' : 's'}` }) : null),
           sugg.length ? h('ul', { class: 'list' }, sugg.slice(0, 5).map((sg) => h('li', {}, sevChip(sg.severity), h('div', { class: 'grow' }, h('b', { text: sg.title }), h('div', { class: 'muted', text: describeAction(sg.action) })),
+            sg.action && sg.action.weakens ? h('span', { class: 'badge weakens-badge', title: sg.action.weakens, text: 'Weakens detection' }) : null,
+            sg.status === 'applying' ? sgStatusBadge(sg.status) : null,
             sg.source === 'ai' ? h('span', { title: 'AI suggestion — review before approving' }, aiBadge('AI suggestion')) : null)))
             : empty('Nothing waiting for approval'))));
       main.append(h('div', { class: 'spacer' }));
@@ -802,6 +839,7 @@
     title: 'Suggestions',
     mount(main, params) {
       this.view = params.get('view') || 'inbox';
+      this.hist = null;
       const runBtn = can('operator') ? h('button', { class: 'btn small', type: 'button', onclick: async () => {
         try { const r = await api('/api/analysis/run', { method: 'POST' }); toast(r.proposed ? `${r.proposed} new suggestion${r.proposed === 1 ? '' : 's'}` : 'No new suggestions'); reloadIf(this)(); }
         catch (e) { toast(e.message, true); }
@@ -816,7 +854,7 @@
     async load() {
       const ok = begin(this);
       if (this.view === 'inbox') {
-        const rows = await api('/api/suggestions');
+        const rows = await api('/api/suggestions' + qs({ limit: 1000 }));
         if (!ok()) return;
         const order = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
         rows.sort((a, b) => (order[a.severity] ?? 5) - (order[b.severity] ?? 5));
@@ -824,16 +862,31 @@
           : h('div', { class: 'card' }, empty('Nothing waiting for approval', 'The analysis runs every minute; new suggestions appear here.')));
         return;
       }
-      const rows = (await api('/api/suggestions?status=all')).filter((x) => x.status !== 'proposed');
-      if (!ok()) return;
+      // The history is paginated by the console (newest first); older pages
+      // are fetched on request and kept while the view stays open.
+      const PAGE = 500;
+      if (!this.hist || this.hist.view !== this.view) this.hist = { view: this.view, pages: 1 };
+      let all = [];
+      let more = false;
+      for (let i = 0; i < this.hist.pages; i++) {
+        const got = await api('/api/suggestions' + qs({ status: 'all', limit: PAGE, offset: i * PAGE }));
+        if (!ok()) return;
+        all = all.concat(got);
+        more = got.length === PAGE;
+        if (!more) break;
+      }
+      const seen = new Set();
+      const rows = all.filter((x) => x.status !== 'proposed' && !seen.has(x.id) && seen.add(x.id));
+      const older = more ? h('div', { class: 'row', style: { justifyContent: 'center', marginTop: '12px' } },
+        h('button', { class: 'btn', type: 'button', onclick: () => { this.hist.pages++; reloadIf(this)(); } }, 'Load older decisions')) : null;
       clear(this.out).append(table([
         { label: 'Decided', cell: (x) => timeEl(x.decided_at) },
         { label: 'Suggestion', cls: 'title-cell', cell: (x) => [h('b', { text: x.title }), h('div', { class: 'muted', text: describeAction(x.action) })] },
         { label: 'Source', cell: (x) => (x.source === 'ai' ? aiBadge('AI suggestion') : h('span', { class: 'badge', text: 'Analysis' })) },
-        { label: 'Outcome', cell: (x) => h('span', { class: 'badge ' + (x.status === 'applied' || x.status === 'accepted' ? 'enforce' : ''), text: cap(x.status) }) },
+        { label: 'Outcome', cell: (x) => [sgStatusBadge(x.status), x.action && x.action.weakens ? h('div', { class: 'weakens-text', text: 'Weakens detection' }) : null] },
         { label: 'By', cell: (x) => x.decided_by || '–' },
         { label: 'Result', cell: (x) => h('div', { class: 'cmd', title: x.result || '', text: x.result || '–' }) },
-      ], rows, { page: 100, state: this.tv, emptyNode: empty('No decisions yet') }));
+      ], rows, { page: 100, state: this.tv, emptyNode: empty('No decisions yet') }), older);
     },
   };
 
@@ -1309,7 +1362,7 @@
       const n = (sm.alerts.open_by_severity.critical || 0) + (sm.alerts.open_by_severity.high || 0);
       const c = $('#nav-alerts');
       c.textContent = String(n); c.hidden = !n; c.title = `${n} open high or critical alerts`;
-      const sg = await api('/api/suggestions');
+      const sg = (await api('/api/suggestions' + qs({ limit: 1000 }))).filter((x) => x.status === 'proposed');
       const cs = $('#nav-suggestions');
       cs.textContent = String(sg.length); cs.hidden = !sg.length; cs.title = `${sg.length} suggestion${sg.length === 1 ? '' : 's'} waiting for approval`;
     } catch { /* shown by banner */ }

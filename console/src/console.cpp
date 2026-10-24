@@ -606,21 +606,6 @@ static std::string jfield(const json &j, const char *k) {
 	return it != j.end() && it->is_string() ? it->get<std::string>() : std::string();
 }
 
-// The role needed to approve or reject a suggestion: what its action stands
-// in for (analysis required_role(): deployer for a rollout, else operator),
-// and never less than operator for one the AI assistant proposed. AI text is
-// shaped by telemetry an attacker can write (prompt injection), so a
-// deployer-level automation token -- enough for a rollout the engine
-// proposed -- can never approve an AI-proposed rollout on the model's word.
-// This route is where that is decided (Analyst::decide checks only the
-// action's role, which this never falls below).
-std::string decide_role(const Suggestion &s) {
-	std::string need = required_role(s.action);
-	if (s.source == "ai" && role_rank(need) < role_rank("operator"))
-		need = "operator";
-	return need;
-}
-
 // Incidents, fleet health, rule review, suggestions and the AI assistant.
 // Returns false when the path is not one of these.
 static bool route_analysis(App &app, const Request &req, Response &r) {
@@ -657,9 +642,36 @@ static bool route_analysis(App &app, const Request &req, Response &r) {
 	if (p == "/api/incidents/triage") {
 		if (!need("POST", "operator"))
 			return true;
+		// alert_ids: the alerts the operator was shown. Only those are triaged
+		// (alerts that joined the incident since keep their status, counted in
+		// "skipped"); when none of them is in the incident any more, nothing is
+		// changed and the answer is 409. Without alert_ids (older clients)
+		// every alert in the incident is triaged.
 		json b = body_json(req);
+		std::vector<std::string> shown;
+		bool has_shown = false;
+		if (auto it = b.find("alert_ids"); it != b.end() && !it->is_null()) {
+			bool ok = it->is_array() && !it->empty() && it->size() <= 100000;
+			for (size_t i = 0; ok && i < it->size(); i++)
+				ok = (*it)[i].is_string();
+			if (!ok) {
+				write_err(r, 400, "alert_ids must be a non-empty array of the alert ids you were shown");
+				return true;
+			}
+			for (auto &x : *it)
+				shown.push_back(x.get<std::string>());
+			has_shown = true;
+		}
 		try {
-			write_json(r, an.triage_incident(jfield(b, "id"), jfield(b, "status"), jfield(b, "note"), user));
+			json res = an.triage_incident(jfield(b, "id"), jfield(b, "status"), jfield(b, "note"), user,
+			                              has_shown ? &shown : nullptr);
+			if (has_shown && res.value("updated", 0) == 0) {
+				res["error"] = "the incident changed since it was shown (none of the alerts you saw are in it any "
+				               "more); reload it and triage again";
+				write_json(r, res, 409);
+			} else {
+				write_json(r, res);
+			}
 		} catch (const std::invalid_argument &e) {
 			write_err(r, 400, e.what());
 		}
@@ -683,13 +695,39 @@ static bool route_analysis(App &app, const Request &req, Response &r) {
 	if (p == "/api/suggestions") {
 		if (!need("GET", "viewer"))
 			return true;
-		// can_approve: whether the caller's role may decide it (decide_role),
-		// whatever its status, so the UI offers only what the route accepts.
-		json list = an.suggestions_json(qfirst(req, "status"));
-		for (auto &j : list) {
-			auto sg = j.contains("id") && j["id"].is_string() ? an.suggestion(j["id"].get<std::string>()) : std::nullopt;
-			j["can_approve"] = sg.has_value() && role_rank(role) >= role_rank(decide_role(*sg));
+		// Paginated, newest first: limit (default 500, at most 1000) and
+		// offset. X-Total-Count is the number matching the status filter, and
+		// X-Next-Offset is set while there are more.
+		// can_approve: whether the caller's role may decide it (approval_role(),
+		// reported as required_role), whatever its status, so the UI offers
+		// only what the route accepts.
+		auto num = [&](const char *k, long dflt, long lo, long hi, long *out) {
+			std::string v = qfirst(req, k);
+			if (v.empty()) {
+				*out = dflt;
+				return true;
+			}
+			if (v.size() > 9 || v.find_first_not_of("0123456789") != std::string::npos)
+				return false;
+			*out = std::stol(v);
+			return *out >= lo && *out <= hi;
+		};
+		long limit = 0, offset = 0;
+		if (!num("limit", 500, 1, 1000, &limit) || !num("offset", 0, 0, 100000000, &offset)) {
+			write_err(r, 400, "limit must be 1..1000 and offset a non-negative integer");
+			return true;
 		}
+		size_t total = 0;
+		json list = an.suggestions_json(qfirst(req, "status"), (size_t)limit, (size_t)offset, &total);
+		for (auto &j : list) {
+			std::string min_role = j.contains("required_role") && j["required_role"].is_string()
+			                           ? j["required_role"].get<std::string>()
+			                           : "admin";
+			j["can_approve"] = role_rank(role) >= role_rank(min_role);
+		}
+		r.set("X-Total-Count", std::to_string(total));
+		if ((size_t)offset + list.size() < total)
+			r.set("X-Next-Offset", std::to_string((size_t)offset + list.size()));
 		write_json(r, list);
 		return true;
 	}
@@ -704,8 +742,12 @@ static bool route_analysis(App &app, const Request &req, Response &r) {
 			write_err(r, 400, "body must be JSON {id, decision: approve|reject, note}");
 			return true;
 		}
+		// approval_role(): what the action stands in for, and never less than
+		// operator for an AI-proposed one (AI text is shaped by telemetry an
+		// attacker can write, so a deployer automation token can never approve
+		// an AI rollout). Checked here first so a refused caller changes nothing.
 		if (auto sg = an.suggestion(jfield(b, "id"))) {
-			std::string min = decide_role(*sg);
+			std::string min = approval_role(*sg);
 			if (role_rank(role) < role_rank(min)) {
 				write_err(r, 403, "this suggestion needs the " + min + " role");
 				return true;
@@ -1322,6 +1364,10 @@ int run(const Config &c) {
 		st.vault = Vault::open(c.in_state(c.vault));
 		Analyst analyst(st);
 		st.replay_hook = [&analyst](const json &rec) { analyst.replay(rec); };
+		// Rejections and recent approvals hold back repeat proposals: they must
+		// outlive the journal segment that recorded them. (Analyst::carry_forward
+		// takes only the analyst's own lock and never calls into the store.)
+		st.carry_hook = [&analyst] { return analyst.carry_forward(); };
 		st.open_journal(c.in_state(c.journal));
 		std::unique_ptr<Assistant> assistant;
 		std::string ai_off = "disabled with -ai=false";

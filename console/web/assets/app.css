@@ -348,3 +348,14 @@ pre.block { background: var(--surface-2); border: 1px solid var(--border); borde
 .list li.finding .chips { margin-top: 6px; }
 .err { color: var(--critical-ink); }
 .card h2 .badge { margin-left: 6px; }
+/* suggestion statuses and curation changes that weaken detection */
+.badge.bad { border-color: var(--critical); color: var(--critical-ink); }
+.badge.warn { border-color: var(--warning); }
+.badge.busy { border-style: dashed; }
+.warn-text { margin: 6px 0; }
+.badge.weakens-badge { border-color: var(--critical); color: var(--critical-ink); font-weight: 650; }
+.weakens { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 6px 10px; border: 1px solid var(--critical); border-left-width: 3px; border-radius: 6px; background: var(--surface-2); color: var(--critical-ink); font-size: 13px; }
+.weakens b { font-weight: 700; }
+.weakens span { color: var(--ink-2); }
+.weakens-text { color: var(--critical-ink); font-size: 12px; font-weight: 600; }
+.sugg.weakens-sugg { box-shadow: inset 3px 0 0 var(--critical); padding-left: 10px; }

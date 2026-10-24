@@ -782,8 +782,10 @@ json Assistant::status_json() {
 }
 
 json Assistant::job_json(const Job &j) {
+	// The question as the journal holds it (redacted): the API never shows
+	// more than an operator could read back after a restart.
 	return {{"id", j.id},           {"kind", j.kind},       {"target", j.kind == "ask" ? "" : j.target},
-	        {"question", j.kind == "ask" ? j.target : ""},  {"by", j.by},
+	        {"question", j.kind == "ask" ? redact(j.target) : ""},  {"by", j.by},
 	        {"status", j.status},   {"created", j.created}, {"started", j.started},
 	        {"finished", j.finished}, {"error", j.error},   {"model", j.model},
 	        {"result", j.result},

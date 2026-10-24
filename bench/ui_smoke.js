@@ -180,7 +180,7 @@ async function whoami(tok) {
       await p.waitForSelector('#confirm:not([hidden])');
       await p.click('#confirm-yes');
       await p.waitForSelector('#toast:not([hidden])');
-      const done = await p.evaluate(async ([tok, t]) => (await (await fetch('/api/suggestions?status=all', { headers: { Authorization: 'Bearer ' + tok } })).json()).find((x) => x.title === t), [admin, title]);
+      const done = await p.evaluate(async ([tok, t]) => (await (await fetch('/api/suggestions?status=all&limit=1000', { headers: { Authorization: 'Bearer ' + tok } })).json()).find((x) => x.title === t), [admin, title]);
       (done && ['applied', 'accepted'].includes(done.status) && done.decided_by === adminName) ? ok(`suggestion "${title}" ${done.status} by ${done.decided_by}`) : report('suggestion approval: ' + JSON.stringify(done));
     } else ok('no suggestions waiting (nothing to approve)');
     await c.close();

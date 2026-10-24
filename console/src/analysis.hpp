@@ -114,8 +114,10 @@ public:
 	json health_json();
 	std::vector<RuleStat> rule_stats();
 	json rules_json();
-	// Newest first, at most `limit`: status "" = open (proposed or applying), "all" = everything.
-	json suggestions_json(const std::string &status, size_t limit = 1000);
+	// Newest first, at most `limit` after skipping `offset`: status "" = open
+	// (proposed or applying), "all" = everything. `total` (when given) gets the
+	// number matching the status filter.
+	json suggestions_json(const std::string &status, size_t limit = 1000, size_t offset = 0, size_t *total = nullptr);
 	std::optional<Suggestion> suggestion(const std::string &id);
 
 	// One analysis pass: proposes new suggestions and expires ones whose

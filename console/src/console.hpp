@@ -61,8 +61,6 @@ bool precheck(App &app, const Request &req, Response &resp);
 // -ai-key-file: the key, or false with why (the console then runs without
 // the assistant, reporting why in GET /api/ai/status).
 bool read_ai_key_file(const std::string &path, std::string *key, std::string *why);
-// The role POST /api/suggestions/decide requires for this suggestion.
-std::string decide_role(const Suggestion &s);
 
 // The sensor ingest server: one thread per connection, bounded twice: at most
 // max_conns connections, and at most max_unbound of them not yet bound by a
