@@ -47,6 +47,9 @@ struct exec_event {
 	uint64_t key;
 	uint32_t flags;
 	uint32_t pad;
+	uint64_t start_ns;
+	uint64_t pstart_ns;
+	char comm[16];
 	char pcomm[16];
 	char exe_name[NAME_LEN];
 	char filename[FNAME_LEN];
@@ -57,6 +60,7 @@ struct exec_event {
 struct conn_event {
 	uint32_t pid;
 	uint32_t uid;
+	uint64_t start_ns;
 	uint16_t dport;
 	uint16_t family;
 	uint32_t daddr4;
@@ -102,6 +106,18 @@ static int quiet_libbpf(enum libbpf_print_level lvl, const char *f, va_list ap)
 	if (lvl == LIBBPF_WARN)
 		return vfprintf(stderr, f, ap);
 	return 0;
+}
+
+/* The kernel's start time (ns since boot) in the units of /proc/<pid>/stat
+ * field 22, which the response code re-checks: clock ticks, ns / (1e9/HZ). */
+static unsigned long long ns_to_ticks(uint64_t ns)
+{
+	static uint64_t ns_per_tick;
+	if (!ns_per_tick) {
+		long hz = sysconf(_SC_CLK_TCK);
+		ns_per_tick = hz > 0 ? 1000000000ull / (uint64_t)hz : 10000000ull;
+	}
+	return ns ? ns / ns_per_tick : 0;
 }
 
 /* Copy at most srclen bytes of src (stopping at a NUL) into dst[cap]. */
@@ -202,15 +218,21 @@ static int on_rb(void *cctx, void *data, size_t sz)
 	p.actor = ACTOR_UNKNOWN;
 	p.actor_src[0] = 0;
 	p.cmd_truncated = (ev->flags & EV_ARGS_TRUNC) != 0;
+	p.start = ns_to_ticks(ev->start_ns);
+	p.pstart = ns_to_ticks(ev->pstart_ns);
 	/* The ring is mapped read-only: copy with explicit bounds instead of
 	 * trusting the kernel's NUL terminators. */
 	ncopy(p.pcomm, sizeof p.pcomm, ev->pcomm, sizeof ev->pcomm);
 	if (!p.pcomm[0])
 		scopy(p.pcomm, sizeof p.pcomm, "?");
 	ncopy(p.exe, sizeof p.exe, ev->filename, sizeof ev->filename);
-	/* The meaningful "what is running" name is the basename of the program
-	 * being executed, matching the connector sensor's semantics. */
-	scopy(p.comm, sizeof p.comm, base_name(p.exe));
+	/* comm is the kernel's own name for the new program (what the connector
+	 * sensor reads from /proc), not one derived from the path here: the
+	 * quarantine code compares the two to tell a program from a script run
+	 * through an interpreter or a renamed process. */
+	ncopy(p.comm, sizeof p.comm, ev->comm, sizeof ev->comm);
+	if (!p.comm[0])
+		scopy(p.comm, sizeof p.comm, base_name(p.exe));
 	if (ev->flags & EV_FDPATH)
 		resolve_fdpath(ev, &p);
 
@@ -320,12 +342,13 @@ static int on_conn(void *cctx, void *data, size_t sz)
 
 	int verdict = netpolicy_check(daddr, dport, (int)a, is_v6, ev->pid);
 	if (telemetry_on)
-		out_flow(ev->pid, ev->uid, ev->comm, a, src, ipstr, dport,
+		out_flow(ev->pid, ns_to_ticks(ev->start_ns), ev->uid, ev->comm, a, src, ipstr, dport,
 		         verdict == NP_DENY ? "deny" : verdict == NP_RATE ? "rate" : "allow");
 	if (verdict != NP_ALLOW) {
 		struct proc p;
 		memset(&p, 0, offsetof(struct proc, cmd));
 		p.pid = ev->pid; p.uid = ev->uid; p.actor = a; p.cmd[0] = 0; p.cmdlen = 0;
+		p.start = ns_to_ticks(ev->start_ns);
 		ncopy(p.comm, sizeof p.comm, ev->comm, sizeof ev->comm);
 		snprintf(p.actor_src, sizeof p.actor_src, "%s", src);
 		char extra[128];
@@ -333,8 +356,10 @@ static int on_conn(void *cctx, void *data, size_t sz)
 		int rate = verdict == NP_RATE;
 		const char *act = rate ? "would-throttle" : "would-block";
 		if (cfg.mode == MODE_ENFORCE) {
-			respond_kill(ev->pid, rate ? "net-rate" : "net-policy"); /* inline correction */
-			act = "blocked";
+			/* The connection may be drained long after it was made: the
+			 * kernel's start time keeps a recycled pid from being killed. */
+			act = respond_kill(ev->pid, p.start, rate ? "net-rate" : "net-policy") == 0 ? "blocked"
+			                                                                          : "block-failed";
 		}
 		if (rate)
 			out_alert("NET-RATE", "T1498", "Outbound connection rate over API limit",

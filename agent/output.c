@@ -122,6 +122,19 @@ static void bint(struct buf *b, const char *key, long v)
 	braw(b, tmp, n);
 }
 
+/* ,"start":N,"pstart":N,"boot":"..." -- which process a pid named (pids are
+ * reused; start counts clock ticks from boot, see struct proc). Left out when
+ * the sensor does not know it. */
+static void bident(struct buf *b, unsigned long long start, unsigned long long pstart)
+{
+	if (!start)
+		return;
+	bint(b, "start", (long)start);
+	if (pstart)
+		bint(b, "pstart", (long)pstart);
+	bkv(b, "boot", boot_tag(), 1);
+}
+
 static int open_log(const char *name)
 {
 	char path[MAX_PATH];
@@ -268,6 +281,7 @@ void out_telemetry(const struct proc *p)
 	bkv(&b, "host", hostname, 1);
 	bint(&b, "pid", p->pid);
 	bint(&b, "ppid", p->ppid);
+	bident(&b, p->start, p->pstart);
 	bint(&b, "uid", p->uid);
 	bkv(&b, "actor", actor_name(p->actor), 1);
 	bkv(&b, "actor_src", p->actor_src, 1);
@@ -302,6 +316,7 @@ void out_alert(const char *rule, const char *mitre, const char *title, enum sev 
 	bkv(&b, "actor_src", p->actor_src, 1);
 	bint(&b, "pid", p->pid);
 	bint(&b, "ppid", p->ppid);
+	bident(&b, p->start, p->pstart);
 	bint(&b, "uid", p->uid);
 	bkv(&b, "comm", p->comm, 1);
 	bkv(&b, "exe", p->exe, 1);
@@ -400,8 +415,8 @@ void out_audit(const char *event, const char *detail, const char *peer)
 }
 
 /* One outbound network flow (telemetry stream, so it is searchable later). */
-void out_flow(pid_t pid, uid_t uid, const char *comm, enum actor a, const char *asrc,
-              const char *dest, int dport, const char *verdict)
+void out_flow(pid_t pid, unsigned long long start, uid_t uid, const char *comm, enum actor a,
+              const char *asrc, const char *dest, int dport, const char *verdict)
 {
 	char line[2048], ts[40];
 	struct buf b;
@@ -412,6 +427,7 @@ void out_flow(pid_t pid, uid_t uid, const char *comm, enum actor a, const char *
 	bkv(&b, "type", "flow", 1);
 	bkv(&b, "host", hostname, 1);
 	bint(&b, "pid", pid);
+	bident(&b, start, 0);
 	bint(&b, "uid", uid);
 	bkv(&b, "actor", actor_name(a), 1);
 	bkv(&b, "actor_src", asrc, 1);
@@ -421,6 +437,37 @@ void out_flow(pid_t pid, uid_t uid, const char *comm, enum actor a, const char *
 	bkv(&b, "verdict", verdict, 1);
 	bend(&b);
 	tel_emit(line, b.n);
+}
+
+/* SIGHUP: reopen the log files by name, so logrotate can rename them away
+ * (create + postrotate kill -HUP) instead of copytruncate, which loses the
+ * lines written between its copy and its truncate. Buffered telemetry goes
+ * to the old file first; a file that cannot be reopened keeps its old fd. */
+void out_reopen(void)
+{
+	out_flush();
+	struct { int *fd; const char *name; int on; } f[] = {
+		{ &fd_alert, "alerts.jsonl", 1 },
+		{ &fd_tel, "telemetry.jsonl", cfg.telemetry },
+		{ &fd_inv, "inventory.jsonl", 1 },
+	};
+	mkdir(cfg.log_dir, 0750);
+	for (size_t i = 0; i < sizeof f / sizeof *f; i++) {
+		if (!f[i].on)
+			continue;
+		int nfd = open_log(f[i].name);
+		if (nfd < 0)
+			continue;
+		if (*f[i].fd >= 0) {
+			if (*f[i].fd < (int)sizeof torn)
+				torn[*f[i].fd] = 0;
+			close(*f[i].fd);
+		}
+		if (nfd < (int)sizeof torn)
+			torn[nfd] = 0;
+		*f[i].fd = nfd;
+	}
+	logmsg("log files reopened (SIGHUP)");
 }
 
 void out_flush(void)

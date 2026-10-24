@@ -13,7 +13,11 @@
  *     since=ISO     ts >= ISO prefix   (since=2026-10-21T20:00)
  *     until=ISO     ts <  ISO prefix
  *     tree=PID      the process PID, every descendant exec'd under it, and
- *                   all their alerts and flows -- "what did this process do"
+ *                   all their alerts and flows -- "what did this process do".
+ *                   Pids are reused, so the tree follows process identities
+ *                   (boot, pid, start time), not bare pids; when several
+ *                   processes held PID on record the newest is shown and the
+ *                   others are listed: tree=PID:START[@BOOT] picks one
  *     limit=N       newest N results (default 1000; 0 = count only)
  *
  * Every segment logrotate left behind is searched, not only the live files:
@@ -65,6 +69,8 @@ static struct { char key[32], val[256]; } flt[MAXF];
 static int nflt;
 static char since[40], until[40], q[256];
 static long tree_root = -1;
+static unsigned long long tree_start; /* tree=PID:START[@BOOT], 0 = newest */
+static char tree_boot[12];
 
 static void oom(void)
 {
@@ -263,6 +269,145 @@ static void seg_close(struct seg *s)
 #endif
 }
 
+/* ---- process identities for tree= ---------------------------------------
+ * A record names its process by (boot, pid, start) and, for an exec, its
+ * parent by (boot, ppid, pstart); records written before these fields
+ * existed have only pids, and are matched by pid as before. */
+struct ident {
+	long pid;
+	unsigned long long start; /* 0: a record without identity (pid only) */
+	char boot[12];
+};
+
+static struct ident *nodes, *incs; /* tree members; every process seen holding a member's pid */
+static size_t nnodes, capnodes, nincs, capincs;
+
+static int ident_of(const char *line, const char *pidkey, const char *startkey, struct ident *id)
+{
+	char v[32];
+	memset(id, 0, sizeof *id);
+	if (!field(line, pidkey, v, sizeof v))
+		return 0;
+	id->pid = atol(v);
+	if (field(line, startkey, v, sizeof v))
+		id->start = strtoull(v, NULL, 10);
+	if (id->start && !field(line, "boot", id->boot, sizeof id->boot))
+		id->start = 0;
+	return 1;
+}
+
+static int same_ident(const struct ident *a, const struct ident *b)
+{
+	return a->pid == b->pid && a->start == b->start && !strcmp(a->boot, b->boot);
+}
+
+static int ident_in(const struct ident *v, size_t n, const struct ident *id)
+{
+	for (size_t i = 0; i < n; i++)
+		if (same_ident(&v[i], id))
+			return 1;
+	return 0;
+}
+
+static void ident_put(struct ident **v, size_t *n, size_t *cap, const struct ident *id)
+{
+	if (ident_in(*v, *n, id))
+		return;
+	if (*n == *cap) {
+		size_t nc = *cap ? *cap * 2 : 64;
+		struct ident *nv = realloc(*v, nc * sizeof *nv);
+		if (!nv)
+			oom();
+		*v = nv;
+		*cap = nc;
+	}
+	(*v)[(*n)++] = *id;
+}
+
+/* Is id (a record's process) a member? A pid-only member (from an old
+ * record, or a root with no identity on record) stands for every process
+ * that held its pid. */
+static int is_member(const struct ident *id)
+{
+	if (!in_tree(id->pid))
+		return 0;
+	for (size_t i = 0; i < nnodes; i++)
+		if (nodes[i].pid == id->pid && (!nodes[i].start || !id->start || same_ident(&nodes[i], id)))
+			return 1;
+	return 0;
+}
+
+/* Is the parent of a record with process c and parent pid ppid a member?
+ * With the parent's start time this is exact. Without it, the parent is the
+ * newest process seen holding ppid that started no later than c. */
+static int parent_member(const struct ident *c, const struct ident *par)
+{
+	if (!in_tree(par->pid))
+		return 0;
+	if (par->start || !c->start)
+		return is_member(par);
+	const struct ident *best = NULL;
+	for (size_t i = 0; i < nincs; i++)
+		if (incs[i].pid == par->pid && !strcmp(incs[i].boot, c->boot) && incs[i].start <= c->start &&
+		    (!best || incs[i].start > best->start))
+			best = &incs[i];
+	if (best)
+		return is_member(best);
+	for (size_t i = 0; i < nnodes; i++) /* only a pid-only member can be it */
+		if (nodes[i].pid == par->pid && !nodes[i].start)
+			return 1;
+	return 0;
+}
+
+/* Which process tree=PID means: the newest one on record that held PID (or
+ * the one started at tree_start, in boot tree_boot), listing the others. */
+static void pick_root(void)
+{
+	struct ident best = { .pid = tree_root };
+	char best_ts[40] = "";
+	struct ident seen[8];
+	size_t nseen = 0, more = 0;
+	char *line = NULL;
+	size_t cap = 0;
+	for (size_t si = 0; si < nsegs; si++) {
+		struct seg s;
+		if (seg_open(&s, segs[si]) < 0)
+			continue;
+		char ts[40];
+		struct ident id;
+		while (seg_line(&s, &line, &cap) > 0) {
+			if (!ident_of(line, "pid", "start", &id) || id.pid != tree_root || !id.start)
+				continue;
+			if ((tree_start && id.start != tree_start) || (tree_boot[0] && strcmp(id.boot, tree_boot)))
+				continue;
+			if (!ident_in(seen, nseen, &id)) {
+				if (nseen < sizeof seen / sizeof *seen)
+					seen[nseen++] = id;
+				else
+					more++;
+			}
+			if (field(line, "ts", ts, sizeof ts) && strcmp(ts, best_ts) >= 0) {
+				best = id;
+				scopy(best_ts, sizeof best_ts, ts);
+			}
+		}
+		seg_close(&s);
+	}
+	free(line);
+	if (tree_start && !best.start)
+		fprintf(stderr, "wispd: tree=%ld:%llu: no process with that start time on record; matching by pid\n",
+		        tree_root, tree_start);
+	if (nseen > 1) {
+		fprintf(stderr, "wispd: tree=%ld: %zu processes held this pid on record; showing the newest "
+		        "(start=%llu boot=%s). Others: ", tree_root, nseen + more, best.start, best.boot);
+		for (size_t i = 0; i < nseen; i++)
+			if (!same_ident(&seen[i], &best))
+				fprintf(stderr, "tree=%ld:%llu@%s ", tree_root, seen[i].start, seen[i].boot);
+		fprintf(stderr, "%s\n", more ? "..." : "");
+	}
+	ident_put(&nodes, &nnodes, &capnodes, &best);
+}
+
 /* Pass 1 for tree=: grow the descendant set until it stops changing, from
  * every record that carries a pid/ppid pair -- exec telemetry when it is on,
  * and alerts regardless (they carry pid+ppid too). Segments are read oldest
@@ -273,22 +418,36 @@ static void seg_close(struct seg *s)
 static void build_tree(void)
 {
 	tree_add(tree_root);
+	pick_root();
 	size_t execs = 0;
 	char *line = NULL;
 	size_t cap = 0;
-	for (size_t before = 0; before != ntree;) {
-		before = ntree;
+	for (size_t before = 0, binc = 0; before != nnodes || binc != nincs;) {
+		before = nnodes;
+		binc = nincs;
+		execs = 0;
 		for (size_t si = 0; si < nsegs; si++) {
 			struct seg s;
 			if (seg_open(&s, segs[si]) < 0)
 				continue;
 			char v[32];
+			struct ident c, par;
 			while (seg_line(&s, &line, &cap) > 0) {
 				if (field(line, "type", v, sizeof v) && !strcmp(v, "exec"))
 					execs++;
-				if (field(line, "ppid", v, sizeof v) && in_tree(atol(v)) &&
-				    field(line, "pid", v, sizeof v))
-					tree_add(atol(v));
+				if (!ident_of(line, "pid", "start", &c))
+					continue;
+				if (c.start && in_tree(c.pid))
+					ident_put(&incs, &nincs, &capincs, &c);
+				if (!ident_of(line, "ppid", "pstart", &par))
+					continue;
+				scopy(par.boot, sizeof par.boot, c.boot);
+				if (par.start && !c.start)
+					par.start = 0;
+				if (parent_member(&c, &par) && !ident_in(nodes, nnodes, &c)) {
+					ident_put(&nodes, &nnodes, &capnodes, &c);
+					tree_add(c.pid);
+				}
 			}
 			seg_close(&s);
 		}
@@ -315,7 +474,8 @@ static int match(const char *line)
 	for (int i = 0; i < nflt; i++)
 		if (!field(line, flt[i].key, v, sizeof v) || strcmp(v, flt[i].val))
 			return 0;
-	if (tree_root >= 0 && !(field(line, "pid", v, sizeof v) && in_tree(atol(v))))
+	struct ident id;
+	if (tree_root >= 0 && !(ident_of(line, "pid", "start", &id) && is_member(&id)))
 		return 0;
 	return 1;
 }
@@ -385,8 +545,13 @@ int forensics_search(int argc, char **argv)
 			snprintf(until, sizeof until, "%s", v);
 		else if (!strcmp(k, "q"))
 			snprintf(q, sizeof q, "%s", v);
-		else if (!strcmp(k, "tree"))
+		else if (!strcmp(k, "tree")) {
 			tree_root = atol(v);
+			const char *c = strchr(v, ':'), *b = strchr(v, '@');
+			tree_start = c ? strtoull(c + 1, NULL, 10) : 0;
+			if (b)
+				snprintf(tree_boot, sizeof tree_boot, "%s", b + 1);
+		}
 		else if (!strcmp(k, "limit"))
 			limit = atol(v);
 		else if (nflt < MAXF) {
@@ -474,5 +639,7 @@ int forensics_search(int argc, char **argv)
 		free(segs[i]);
 	free(segs);
 	free(tree);
+	free(nodes);
+	free(incs);
 	return 0;
 }

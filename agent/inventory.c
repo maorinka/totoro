@@ -80,13 +80,16 @@ int inventory_owns_wd(int wd)
 	return 0;
 }
 
-/* Read "version" out of a package.json / extension manifest. */
+/* Read "version" out of a package.json / extension manifest. These live in
+ * directories users write (home directories, extension folders): read_user
+ * refuses a FIFO or device planted there (it would hang the sensor) and a
+ * symlink to some other file. */
 static void read_json_version(const char *dir, char *ver, size_t vlen)
 {
 	ver[0] = 0;
 	char path[MAX_PATH], buf[4096];
 	snprintf(path, sizeof path, "%s/package.json", dir);
-	if (read_small(AT_FDCWD, path, buf, sizeof buf) <= 0)
+	if (read_user(AT_FDCWD, path, buf, sizeof buf) <= 0)
 		return;
 	char *v = strstr(buf, "\"version\"");
 	if (!v)
