@@ -186,9 +186,13 @@ if [[ -n $k0 && -n $k1 ]]; then
 else
   info "in-kernel eBPF cost not measured (needs bpftool with pid support and kernel.bpf_stats_enabled)"
 fi
-r0=$(awk '{print $1}' /proc/$P/schedstat); sleep 10; r1=$(awk '{print $1}' /proc/$P/schedstat)
-ipct=$(python3 -c "print(f'{100*($r1-$r0)/10e9:.4f}')")
-python3 -c "import sys;sys.exit(0 if $ipct<0.01 else 1)" && ok "CPU $ipct% at idle" || no "idle cpu high: $ipct%"
+# 30 s, not 10: on a shared runner a few background execs or one housekeeping
+# pass dominate a short window. The fork count shows how idle the host was.
+f0=$(awk '/^processes/{print $2}' /proc/stat); r0=$(awk '{print $1}' /proc/$P/schedstat); sleep 30
+r1=$(awk '{print $1}' /proc/$P/schedstat); f1=$(awk '/^processes/{print $2}' /proc/stat)
+ipct=$(python3 -c "print(f'{100*($r1-$r0)/30e9:.4f}')")
+python3 -c "import sys;sys.exit(0 if $ipct<0.01 else 1)" && ok "CPU $ipct% at idle ($((f1-f0)) host forks in 30 s)" \
+  || no "idle cpu high: $ipct% ($((f1-f0)) host forks in 30 s)"
 stop_all
 
 echo "== runtime vulnerability mitigation (cross-process, live, no restart) =="
@@ -350,7 +354,7 @@ for p in 10 50 100; do curl -s -X POST "127.0.0.1:$P_HTTP/api/policy/rollout?act
 for _ in $(seq 40); do [ "$(ls "$VC"/ctl/*.ctl 2>/dev/null | wc -l)" -ge 19 ] && break; sleep 0.25; done  # each live simulated host writes one file
 rodiag=$(api /api/policy/rollout | python3 -c '
 import sys,json,glob
-rs=sorted(json.load(sys.stdin), key=lambda r: r["ts"])  # API returns newest first
+rs=json.load(sys.stdin)[::-1]  # API lists in journal order, newest first; stages share a timestamp
 c=[set(r["cohort"]) for r in rs]
 got={f.split("/")[-1][:-4] for f in glob.glob(sys.argv[1]+"/ctl/*.ctl")}
 # prod-05 is the silent host: already stale, so it stays in the cohort but is
