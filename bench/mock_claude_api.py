@@ -5,8 +5,11 @@ assistant without an API key or network access.
     python3 bench/mock_claude_api.py --port 9443 --cert C.crt --key C.key [--log requests.jsonl]
 
 It serves POST /v1/messages over TLS and checks each request the way the real
-API would (headers, model, structured-output schema rules, strict tools,
-tool_use / tool_result pairing, the fallback beta). A request that breaks a
+API would (the anthropic-version header 2023-06-01, model, no sampling
+parameters, thinking adaptive or omitted, no forced tool_choice, structured-
+output schema rules, strict tools, tool_use / tool_result pairing, the
+fallback beta, the 32 MB request limit), plus one console invariant: untrusted
+data never closes its <fleet_data> block early. A request that breaks a
 rule gets a 400 invalid_request_error, so the console's error path is
 exercised too. Replies are deterministic:
 
@@ -37,8 +40,9 @@ def problems(req, headers):
     out = []
     if not headers.get("x-api-key"):
         out.append("missing x-api-key")
-    if headers.get("anthropic-version") != "2026-10-21":
-        out.append("anthropic-version must be 2026-10-21")
+    # The Messages API version header; anything else is refused, as the real API does.
+    if headers.get("anthropic-version") != "2023-06-01":
+        out.append("anthropic-version must be 2023-06-01")
     if not isinstance(req.get("model"), str) or not req["model"].startswith("claude-"):
         out.append("model")
     if not isinstance(req.get("max_tokens"), int) or req["max_tokens"] <= 0:
@@ -49,6 +53,9 @@ def problems(req, headers):
     th = req.get("thinking")
     if th is not None and th.get("type") != "adaptive":
         out.append("thinking must be adaptive or omitted")
+    tc = req.get("tool_choice")
+    if isinstance(tc, dict) and tc.get("type") in ("any", "tool"):
+        out.append("tool_choice: type \"tool\" and \"any\" are not supported for this model")
     if "fallbacks" in req:
         if req["fallbacks"] != "default" or "server-side-fallback-2026-07-01" not in headers.get("anthropic-beta", ""):
             out.append("fallbacks needs the server-side-fallback-2026-07-01 beta")
@@ -76,6 +83,13 @@ def problems(req, headers):
                 out.append("every tool_use needs its tool_result in the next user message")
     if msgs and msgs[-1].get("role") == "assistant":
         out.append("assistant prefill is not supported")
+    # Untrusted data must not be able to close its own block (the console escapes '<' and '>').
+    for m in msgs:
+        parts = [m.get("content")] if isinstance(m.get("content"), str) else \
+            [c.get("content") or c.get("text") for c in (m.get("content") or []) if isinstance(c, dict)]
+        for p in parts:
+            if isinstance(p, str) and p.count("</fleet_data>") > p.count("<fleet_data>"):
+                out.append("unbalanced </fleet_data> in a message")
     return out
 
 
@@ -180,7 +194,10 @@ class H(BaseHTTPRequestHandler):
         self.wfile.write(b)
 
     def do_POST(self):
-        body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        n = int(self.headers.get("Content-Length", 0))
+        if n > 32 << 20:  # the API's request size limit
+            return self.send(413, {"type": "error", "error": {"type": "request_too_large", "message": "request exceeds 32 MB"}})
+        body = self.rfile.read(n)
         hdrs = {k.lower(): v for k, v in self.headers.items()}
         try:
             req = json.loads(body)
