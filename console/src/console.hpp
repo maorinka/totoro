@@ -22,6 +22,9 @@ struct Config {
 	bool listen_set = false;  // -listen given explicitly (else -dev plaintext ingest binds loopback)
 	int journal_max_mb = 256;  // 0: never rotate
 	int max_sensors = 16384;   // concurrent ingest connections (one thread each)
+	int max_hosts = 100000;    // hosts not retired, in all
+	int max_hosts_per_cert = 0;  // ...per sensor client certificate (0: no bound; shared fleet certificates)
+	bool http_proxy_local = false;  // loopback HTTP clients share the per-client cap with no one (a local proxy)
 	std::chrono::nanoseconds stale_after{}, decom_after{};
 	bool dev = false, show_version = false;
 	// analysis and the optional AI assistant
@@ -44,6 +47,7 @@ struct App {
 	Store &store;
 	Analyst *analyst = nullptr;
 	Assistant *ai = nullptr;
+	std::string ai_off = "disabled with -ai=false";  // why ai is null (GET /api/ai/status)
 };
 
 // The whole HTTP surface (routing, auth, security headers, access log). Pure:
@@ -54,6 +58,11 @@ void handle(Store &st, const Request &req, Response &resp);
 // authenticated API request is answered from its headers alone (false), so
 // unauthenticated clients can never make the console buffer a body.
 bool precheck(App &app, const Request &req, Response &resp);
+// -ai-key-file: the key, or false with why (the console then runs without
+// the assistant, reporting why in GET /api/ai/status).
+bool read_ai_key_file(const std::string &path, std::string *key, std::string *why);
+// The role POST /api/suggestions/decide requires for this suggestion.
+std::string decide_role(const Suggestion &s);
 
 // The sensor ingest server: one thread per connection, bounded twice: at most
 // max_conns connections, and at most max_unbound of them not yet bound by a

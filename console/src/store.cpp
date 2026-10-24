@@ -26,11 +26,14 @@ using Mono = steady_clock;
 
 // Segment header format. 2: sensor lines carry rx_ts, console records carry
 // "src":"console", and CONSOLE_ONLY covers both (so neither can be forged).
-static constexpr int JOURNAL_FORMAT = 2;
-// Replay accepts any line this console can have written (a rollout record for
-// a 30,000-host cohort is about 1.4 MiB); sensor lines are far smaller
-// (Store::sensor_max_line).
+// 3: hellos carry the client certificate (cert_fp, cert_name, cert_refused),
+// rollout records may be split in parts, and "audit" is console-only; format-2
+// segments could hold those fields from a sensor, so they are ignored there.
+static constexpr int JOURNAL_FORMAT = 3;
+// Replay accepts any line this console can have written; sensor lines are far
+// smaller (Store::sensor_max_line).
 static constexpr size_t MAX_REPLAY_LINE = 64u << 20;
+
 
 const std::map<std::string, std::string> &control_commands() {
 	static const std::map<std::string, std::string> m = {
@@ -46,7 +49,8 @@ const std::map<std::string, std::string> &control_commands() {
 // history, receipt times or console provenance that a later replay would trust.
 static const char *const CONSOLE_ONLY[] = {"id",        "status", "note",   "triaged_by", "triaged_at", "percent",
                                            "cohort",    "delivered", "failed", "by",      "rx_ts",      "src",
-                                           "id_kept",   "send_failed"};
+                                           "id_kept",   "send_failed", "cert_fp", "cert_name", "cert_refused",
+                                           "part",      "parts"};
 
 std::string sanitize(const std::string &raw) {
 	json m;
@@ -60,8 +64,13 @@ std::string sanitize(const std::string &raw) {
 	bool changed = false;
 	for (auto k : CONSOLE_ONLY)
 		changed |= m.erase(k) > 0;
-	return changed ? m.dump() : raw;
+	return changed ? m.dump(-1, ' ', false, json::error_handler_t::replace) : raw;
 }
+
+// A journal line for a record the console builds: text that is not UTF-8 (a
+// vault key or host name echoed from a request, model output) is written as
+// U+FFFD instead of throwing and losing the record.
+static std::string journal_line(const json &j) { return j.dump(-1, ' ', false, json::error_handler_t::replace); }
 
 std::string with_fields(const std::string &raw, const json &fields) {
 	json m;
@@ -74,7 +83,7 @@ std::string with_fields(const std::string &raw, const json &fields) {
 		return raw;
 	for (auto &[k, v] : fields.items())
 		m[k] = v;
-	return m.dump();
+	return m.dump(-1, ' ', false, json::error_handler_t::replace);
 }
 
 // A host's stable position in [0,100): a larger rollout percentage is always a
@@ -93,7 +102,7 @@ std::string grade(int score) {
 // is dropped at ingest.
 static bool console_only_type(const std::string &t) {
 	return t == "triage" || t == "rollout" || t == "rollout_intent" || t == "lifecycle" || t == "journal" ||
-	       Store::console_record_type(t);
+	       t == "audit" || Store::console_record_type(t);
 }
 
 // How strongly a host identity is anchored (agent/identity.c tiers).
@@ -128,6 +137,15 @@ static bool segment_header(const json &j) {
 	auto t = j.find("type"), s = j.find("src"), f = j.find("format");
 	return t != j.end() && *t == "journal" && s != j.end() && *s == "console" && f != j.end() &&
 	       f->is_number_integer() && f->get<long long>() >= 2;
+}
+
+// A short, non-secret tag for an identity value in alert text: enough to tell
+// two apart, never the value itself (a host_id is what an impostor needs).
+static std::string tag(const std::string &v) {
+	if (v.empty())
+		return "none";
+	auto d = sha256(v);
+	return "#" + hex_encode(d.data(), 4);
 }
 
 // Go's encoding/json matches object keys to struct fields case-insensitively
@@ -180,6 +198,7 @@ void Store::open_journal(const std::string &path) {
 		// sensor lines may carry fields this version reserves (it did not
 		// strip rx_ts/src), so those fields are ignored there.
 		bool trusted = false;
+		long long format = 0;
 		std::string line;
 		while (std::getline(in, line)) {
 			if (line.size() > MAX_REPLAY_LINE)
@@ -194,9 +213,18 @@ void Store::open_journal(const std::string &path) {
 				continue;
 			Event e = event_from_json(j);
 			if (e.type == "journal") {
-				if (segment_header(j))
+				if (segment_header(j)) {
 					trusted = true;
+					format = j["format"].get<long long>();
+				}
 				continue;
+			}
+			if (format < 3) {
+				// Not stripped from sensor lines before format 3.
+				e.cert_fp.clear();
+				e.cert_name.clear();
+				e.cert_refused = false;
+				e.part = e.parts = 0;
 			}
 			if (!trusted) {
 				if (ambiguous_keys(j)) {
@@ -223,6 +251,10 @@ void Store::open_journal(const std::string &path) {
 				n++;
 				continue;
 			}
+			if (e.type == "audit" && (!trusted || e.src != "console")) {
+				untrusted_console++;  // only this version writes audit records, always marked
+				continue;
+			}
 			// When did the console see it? Its own records carry its clock;
 			// sensor records carry the receipt time it stamped. A sensor's own
 			// ts is only a fallback (older journals), never later than mtime.
@@ -240,6 +272,19 @@ void Store::open_journal(const std::string &path) {
 			n++;
 		}
 	}
+	// Split records whose last part never reached disk: show what there is.
+	for (auto &[key, p] : partial_) {
+		p.r.status = "interrupted";
+		if (key.rfind("rollout|", 0) == 0) {
+			intents_.erase(p.r.id);
+			rollouts_.push_back(std::move(p.r));
+		} else if (!intents_.count(p.r.id) && !partial_.count("rollout|" + p.r.id) &&
+		           std::none_of(rollouts_.begin(), rollouts_.end(), [&](const Rollout &x) { return x.id == p.r.id; })) {
+			intents_[p.r.id] = std::move(p.r);
+		}
+	}
+	partial_.clear();
+	recount();
 	// A rollout_intent without its rollout record: the console stopped
 	// mid-push. Some hosts may have been switched; show it rather than forget it.
 	for (auto &[_, r] : intents_)
@@ -404,7 +449,7 @@ static bool security_record(const std::string &type, const json &m) {
 		return c != m.end() && c->is_string() && c->get<std::string>() == "decommissioned";
 	}
 	return type == "alert" || type == "triage" || type == "rollout" || type == "rollout_intent" ||
-	       type == "suggestion" || type == "suggestion_decision";
+	       type == "suggestion" || type == "suggestion_decision" || type == "audit";
 }
 
 void Store::index_event(const std::string &raw) {
@@ -433,7 +478,21 @@ void Store::index_event(const std::string &raw) {
 	}
 }
 
-void Store::record(const std::string &raw, bool sync) {
+bool Store::record(const std::string &raw, bool sync) {
+	if (journal_closed_) {
+		// The console is shutting down (or a test closed the journal): a record
+		// accepted now would exist in memory only and vanish at exit, which an
+		// audit trail must never do silently. Refuse it, and say so.
+		closed_dropped_++;
+		auto mono = Mono::now();
+		if (closed_logged_ == Mono::time_point{} || mono - closed_logged_ > minutes(1)) {
+			closed_logged_ = mono;
+			logf("journal: %s is closed; refused %llu record(s) (latest: %s)", journal_path_.c_str(), closed_dropped_,
+			     clip(raw, 160).c_str());
+			closed_dropped_ = 0;
+		}
+		return false;
+	}
 	if (journal_fd_ >= 0) {
 		std::string line;
 		line.reserve(raw.size() + 2);
@@ -451,7 +510,7 @@ void Store::record(const std::string &raw, bool sync) {
 			                           ftruncate(journal_fd_, st.st_size - (off_t)off) == 0);
 			if (!undone)
 				need_newline_ = true;
-			journal_failure("write", err);
+			journal_failure("write", err);  // kept in memory; health and /readyz report it
 		} else {
 			need_newline_ = false;
 			journal_size_ += (long long)off;
@@ -470,6 +529,7 @@ void Store::record(const std::string &raw, bool sync) {
 			rotate();
 	}
 	index_event(raw);
+	return true;
 }
 
 void Store::close_journal() {
@@ -537,9 +597,33 @@ std::string Store::host_state(const Host &h, TimePoint now) const {
 // recorded.
 void Store::identity_check(Event &e) {
 	auto it = hosts_.find(e.host);
-	if (it == hosts_.end() || it->second.host_id.empty())
+	if (it == hosts_.end())
 		return;
 	const Host &h = it->second;
+	// The client certificate: the first one a host connects with is recorded,
+	// and a connection presenting another one never takes over its control
+	// lines (a stolen certificate cannot silently become the host). A renewal
+	// -- the same subject and the same host identity, with no connection on
+	// the recorded certificate left -- is accepted, and flagged all the same.
+	// A retired host that returns is provisioned again, certificate included.
+	if (!h.cert_fp.empty() && e.cert_fp != h.cert_fp && h.decommissioned.empty()) {
+		bool pinned_live = false;
+		if (auto l = links_.find(e.host); l != links_.end())
+			for (auto &x : l->second)
+				pinned_live |= x.cert_fp == h.cert_fp;
+		bool renewal = !pinned_live && !e.cert_fp.empty() && !h.cert_name.empty() && e.cert_name == h.cert_name &&
+		               e.host_id == h.host_id && trust_rank(e.trust) >= trust_rank(h.trust);
+		e.cert_refused = !renewal;
+		std::string why = "Sensor certificate changed (was sha256 " + clip(h.cert_fp, 16) + ", now " +
+		                  (e.cert_fp.empty() ? std::string("none") : "sha256 " + clip(e.cert_fp, 16)) + ")";
+		why += renewal ? "; accepted as a renewal (same subject and host identity, no connection on the recorded "
+		                 "certificate)"
+		               : "; the connection was refused control of the host";
+		console_alert("HOST-ID-MISMATCH", "high", e.host, why,
+		              "a sensor connected with a different client certificate for an existing hostname");
+	}
+	if (h.host_id.empty())
+		return;
 	auto original_live = [&] {
 		auto l = links_.find(e.host);
 		if (l == links_.end())
@@ -552,10 +636,10 @@ void Store::identity_check(Event &e) {
 	std::string why;
 	bool kept = false;
 	if (e.host_id.empty()) {
-		why = "Host identity missing (was " + clip(h.host_id) + "; the hello presented none)";
+		why = "Host identity missing (the hello presented none)";
 		kept = true;
 	} else if (e.host_id != h.host_id) {
-		why = "Host identity changed (was " + clip(h.host_id) + ", now " + clip(e.host_id) + ")";
+		why = "Host identity changed (was " + tag(h.host_id) + ", now " + tag(e.host_id) + ")";
 		kept = original_live();
 	} else if (trust_rank(e.trust) < trust_rank(h.trust)) {
 		why = "Host identity trust downgraded (was " + clip(h.trust, 16) + ", now " +
@@ -598,6 +682,12 @@ void Store::ingest_locked(Event &e, std::string raw, std::vector<Event> &notify_
 		identity_check(e);
 		if (e.id_kept)
 			add["id_kept"] = true;
+		if (!e.cert_fp.empty()) {
+			add["cert_fp"] = e.cert_fp;
+			add["cert_name"] = e.cert_name;
+		}
+		if (e.cert_refused)
+			add["cert_refused"] = true;
 	}
 	// Some sensor records (hello, bye) carry no timestamp; stamp receipt time.
 	if (e.ts.empty()) {
@@ -623,6 +713,8 @@ void Store::ingest_locked(Event &e, std::string raw, std::vector<Event> &notify_
 	pending_notify_.clear();
 }
 
+static size_t event_bytes(const Event &e);
+
 void Store::add_alert(const Event &e, bool replay) {
 	auto a = std::make_shared<Event>(e);
 	if (a->status.empty())
@@ -643,7 +735,7 @@ void Store::add_alert(const Event &e, bool replay) {
 			legacy_alias_["R" + std::to_string(++legacy_seq_)] = id;
 	}
 	alert_by_id_[a->id] = a;
-	alerts_.push(a->host, a, max_ring, [&](const std::shared_ptr<Event> &old) {
+	alerts_.push(a->host, a, event_bytes(*a) + 64, max_ring, max_ring_bytes, [&](const std::shared_ptr<Event> &old) {
 		auto f = alert_by_id_.find(old->id);
 		if (f != alert_by_id_.end() && f->second == old)
 			alert_by_id_.erase(f);
@@ -663,6 +755,7 @@ static size_t event_bytes(const Event &e) {
 	                             &e.where,   &e.change, &e.path,   &e.mode,   &e.reason, &e.status,   &e.note,
 	                             &e.triaged_by, &e.triaged_at, &e.by, &e.rx_ts, &e.src})
 		n += f->size();
+	n += e.cert_fp.size() + e.cert_name.size();
 	for (const auto *v : {&e.runtimes, &e.cohort, &e.delivered, &e.failed, &e.send_failed})
 		for (auto &x : *v)
 			n += x.size() + sizeof(std::string);
@@ -742,6 +835,29 @@ void Store::apply(const Event &e, TimePoint at, bool replay) {
 	if (e.type == "rollout" || e.type == "rollout_intent") {
 		Rollout r{parse_ts(e.ts), e.by, e.action, e.group, (int)e.percent, e.cohort, e.delivered, e.failed,
 		          e.id,           "",   e.send_failed};
+		if (replay && e.parts > 1 && !e.id.empty()) {
+			// One part of a split record: join them before it counts.
+			if (e.part < 1 || e.part > e.parts || e.parts > 100000)
+				return;
+			auto &p = partial_[e.type + "|" + e.id];
+			if (p.seen.empty()) {
+				p.r = r;
+				p.r.cohort.clear();
+				p.r.delivered.clear();
+				p.r.failed.clear();
+				p.r.send_failed.clear();
+				p.parts = e.parts;
+			}
+			if (e.parts != p.parts || !p.seen.insert(e.part).second)
+				return;
+			for (auto [from, to] : {std::pair{&r.cohort, &p.r.cohort}, std::pair{&r.delivered, &p.r.delivered},
+			                        std::pair{&r.failed, &p.r.failed}, std::pair{&r.send_failed, &p.r.send_failed}})
+				to->insert(to->end(), from->begin(), from->end());
+			if ((long long)p.seen.size() < p.parts)
+				return;
+			r = std::move(p.r);
+			partial_.erase(e.type + "|" + e.id);
+		}
 		if (e.type == "rollout_intent") {
 			if (replay && !e.id.empty()) {
 				r.status = "interrupted";
@@ -769,7 +885,11 @@ void Store::apply(const Event &e, TimePoint at, bool replay) {
 	if (!replay)
 		h.last_contact = Mono::now();
 	if (e.type == "hello") {
-		if (!e.id_kept) {
+		if (!e.cert_refused && !e.cert_fp.empty()) {
+			h.cert_fp = e.cert_fp;  // first contact, a renewal, or a returning retired host
+			h.cert_name = e.cert_name;
+		}
+		if (!e.id_kept && !e.cert_refused) {
 			h.version = e.version;
 			// An id-less hello never erases a recorded identity.
 			if (!e.host_id.empty() || h.host_id.empty()) {
@@ -816,7 +936,7 @@ void Store::apply(const Event &e, TimePoint at, bool replay) {
 		add_alert(e, replay);
 	} else if (e.type == "inventory") {
 		if (inventory_update(e, replay))
-			inventory_.push(e.host, e, max_ring, [](const Event &) {});
+			inventory_.push(e.host, e, event_bytes(e) + 64, max_ring, max_ring_bytes, [](const Event &) {});
 	}
 }
 
@@ -836,7 +956,7 @@ void Store::console_alert(const std::string &rule, const std::string &sev, const
 	e.actor = "console";
 	e.status = "open";
 	e.src = "console";
-	record(event_to_json(e).dump());
+	record(journal_line(event_to_json(e)));
 	apply(e, Clock::now(), false);
 }
 
@@ -849,7 +969,7 @@ void Store::lifecycle_record(Host &h, const std::string &change, const std::stri
 	e.change = change;
 	e.reason = reason;
 	e.src = "console";
-	record(event_to_json(e).dump());
+	record(journal_line(event_to_json(e)));
 	h.journaled_seen = Clock::now();
 }
 
@@ -922,8 +1042,8 @@ void Store::reap() {
 			r.change = "removed";
 			r.reason = "not in the sensor's inventory after it reconnected";
 			r.src = "console";
-			record(event_to_json(r).dump());
-			inventory_.push(r.host, r, max_ring, [](const Event &) {});
+			record(journal_line(event_to_json(r)));
+			inventory_.push(r.host, r, event_bytes(r) + 64, max_ring, max_ring_bytes, [](const Event &) {});
 			iv.bytes -= std::min(iv.bytes, event_bytes(it->second.e) + it->first.size());
 			it = iv.items.erase(it);
 			changed = true;
@@ -947,6 +1067,7 @@ void Store::reap() {
 			changed = true;
 		}
 	}
+	recount();
 	if (changed)
 		bump();
 }
@@ -992,8 +1113,52 @@ bool Store::admit(SensorSession &s, size_t len) {
 	return false;
 }
 
+void Store::recount() {
+	live_hosts_ = 0;
+	cert_hosts_.clear();
+	for (auto &[_, h] : hosts_)
+		if (h.decommissioned.empty()) {
+			live_hosts_++;
+			if (!h.cert_fp.empty())
+				cert_hosts_[h.cert_fp]++;
+		}
+}
+
+// A hello that would add a host (new, or retired and returning) is admitted
+// only within max_hosts and max_hosts_per_cert: a stolen sensor certificate
+// cannot mint hosts until the console runs out of memory.
+bool Store::admit_host(const Event &e, const SensorSession &s) {
+	if (auto it = hosts_.find(e.host); it != hosts_.end() && it->second.decommissioned.empty())
+		return true;
+	const char *why = nullptr;
+	if (live_hosts_ >= max_hosts)
+		why = "the console's host limit is reached";
+	else if (max_hosts_per_cert && !s.cert_fp.empty() && cert_hosts_[s.cert_fp] >= max_hosts_per_cert)
+		why = "this client certificate already speaks for the most hosts allowed";
+	if (!why) {
+		live_hosts_++;
+		if (!s.cert_fp.empty())
+			cert_hosts_[s.cert_fp]++;
+		return true;
+	}
+	cap_refused_++;
+	auto mono = Mono::now();
+	if (cap_logged_ == Mono::time_point{} || mono - cap_logged_ > minutes(1)) {
+		cap_logged_ = mono;
+		logf("ingest: refused %llu hello(s) for new hosts: %s (latest %s; limits: %zu hosts, %zu per certificate)",
+		     cap_refused_, why, clip(e.host, 64).c_str(), max_hosts, max_hosts_per_cert);
+		cap_refused_ = 0;
+	}
+	return false;
+}
+
+// Whether a link may carry a host's control lines: it authenticated with the
+// certificate recorded for the host (or none is recorded).
+bool Store::cert_ok(const LiveLink &l, const Host &h) const { return h.cert_fp.empty() || l.cert_fp == h.cert_fp; }
+
 // The live connection that receives control lines for a host: the newest one
-// presenting the recorded identity, else the newest one.
+// presenting the recorded identity, else the newest one -- never one whose
+// client certificate differs from the recorded one.
 void Store::choose_link(const std::string &host) {
 	auto it = links_.find(host);
 	if (it == links_.end() || it->second.empty()) {
@@ -1004,6 +1169,8 @@ void Store::choose_link(const std::string &host) {
 	const LiveLink *best = nullptr;
 	bool best_match = false;
 	for (auto &l : it->second) {
+		if (h != hosts_.end() && !cert_ok(l, h->second))
+			continue;
 		bool match = h == hosts_.end() || h->second.host_id.empty() ||
 		             (l.host_id == h->second.host_id && trust_rank(l.trust) >= trust_rank(h->second.trust));
 		if (!best || (match && !best_match) || (match == best_match && l.seq > best->seq)) {
@@ -1011,7 +1178,10 @@ void Store::choose_link(const std::string &host) {
 			best_match = match;
 		}
 	}
-	conns_[host] = best->link;
+	if (best)
+		conns_[host] = best->link;
+	else
+		conns_.erase(host);
 }
 
 void Store::sensor_line(SensorSession &s, const std::string &line) {
@@ -1043,6 +1213,11 @@ void Store::sensor_line(SensorSession &s, const std::string &line) {
 	e.src.clear();
 	e.id_kept = false;
 	e.send_failed.clear();
+	e.cert_refused = false;
+	e.part = e.parts = 0;
+	// The certificate is the connection's, never the line's.
+	e.cert_fp = s.cert_fp;
+	e.cert_name = s.cert_name;
 	if (console_only_type(e.type) || e.host == "console")
 		return;  // console-only record types, and the console's reserved name
 	if (e.type == "hello") {
@@ -1064,12 +1239,14 @@ void Store::sensor_line(SensorSession &s, const std::string &line) {
 			if (c == conns_.end() || c->second != s.link)
 				return;
 		}
+		if (e.type == "hello" && !admit_host(e, s))
+			return;
 		ingest_locked(e, sanitize(line), notify_now);
 		if (e.type == "hello") {
 			auto &v = links_[e.host];
 			auto it = std::find_if(v.begin(), v.end(), [&](const LiveLink &l) { return l.link == s.link; });
 			if (it == v.end())
-				v.push_back({s.link, e.host_id, e.trust, ++link_seq_});
+				v.push_back({s.link, e.host_id, e.trust, s.cert_fp, ++link_seq_});
 			else {
 				it->host_id = e.host_id;
 				it->trust = e.trust;
@@ -1134,6 +1311,11 @@ int Store::push_one(const std::string &host, const std::string &cmd) {
 		std::shared_lock lk(mu_);
 		auto it = conns_.find(host);
 		if (it == conns_.end())
+			return 1;
+		// A host the Hosts page shows as stale has not been heard from within
+		// stale_after: its connection may be half-open, so a write would only
+		// reach a socket buffer. Never report that as delivered.
+		if (auto h = hosts_.find(host); h != hosts_.end() && host_state(h->second, Clock::now()) != "active")
 			return 1;
 		link = it->second;
 	}
@@ -1670,7 +1852,8 @@ json Store::triage(const std::string &id, const std::string &status, const std::
 	ev.by = by;
 	ev.src = "console";
 	auto alert = it->second;
-	record(event_to_json(ev).dump(), true);
+	if (!record(journal_line(event_to_json(ev)), true))
+		throw std::runtime_error("the journal is closed (the console is stopping); triage not recorded");
 	apply(ev, Clock::now(), false);
 	return event_to_json(*alert);
 }
@@ -1710,7 +1893,8 @@ Rollout Store::rollout(const std::string &action, const std::string &group, int 
 		std::unique_lock lk(mu_);
 		r.id = ev.id = "RO" + std::to_string(unix_now()) + "-" + std::to_string(++rollout_seq_);
 		ev.type = "rollout_intent";
-		record(event_to_json(ev).dump(), true);
+		if (!record_parts(ev, true))
+			throw std::runtime_error("the journal is closed (the console is stopping); rollout not started");
 	}
 	// Push in parallel: each write may wait up to the link's deadline, and a
 	// few wedged sensors must not stretch a fleet rollout to minutes. Once the
@@ -1745,12 +1929,59 @@ Rollout Store::rollout(const std::string &action, const std::string &group, int 
 		ev.delivered = r.delivered;
 		ev.failed = r.failed;
 		ev.send_failed = r.send_failed;
-		record(event_to_json(ev).dump(), true);
+		record_parts(ev, true);
 		apply(ev, r.ts, false);
 	}
 	logf("rollout %s action=%s group=\"%s\" percent=%d cohort=%zu delivered=%zu send_failed=%zu by=%s", r.id.c_str(),
 	     action.c_str(), group.c_str(), percent, r.cohort.size(), r.delivered.size(), r.send_failed.size(), by.c_str());
 	return r;
+}
+
+// Journals a rollout or rollout_intent record, split into parts (each with
+// its slice of the cohort and the matching outcomes) when one line would be
+// longer than max_record (older consoles -- the Go 1.0 one stops reading a
+// segment at a line over 1 MiB -- must replay every line). Replay joins the
+// parts again.
+bool Store::record_parts(Event ev, bool sync) {
+	std::string one = journal_line(event_to_json(ev));
+	if (one.size() <= max_record)
+		return record(one, sync);
+	// Each name appears in at most three lists (cohort, delivered or failed,
+	// send_failed), escaped at worst six bytes per byte: half of max_record
+	// of names leaves the other half for the rest of the record.
+	std::vector<std::vector<std::string>> chunks(1);
+	size_t used = 0;
+	for (auto &h : ev.cohort) {
+		size_t cost = 3 * (6 * h.size() + 3);
+		if (used + cost > max_record / 2 && !chunks.back().empty()) {
+			chunks.emplace_back();
+			used = 0;
+		}
+		chunks.back().push_back(h);
+		used += cost;
+	}
+	std::set<std::string> delivered(ev.delivered.begin(), ev.delivered.end()),
+	    failed(ev.failed.begin(), ev.failed.end()), send_failed(ev.send_failed.begin(), ev.send_failed.end());
+	bool ok = true;
+	for (size_t k = 0; k < chunks.size(); k++) {
+		Event p = ev;
+		p.cohort = chunks[k];
+		p.delivered.clear();
+		p.failed.clear();
+		p.send_failed.clear();
+		for (auto &h : p.cohort) {
+			if (delivered.count(h))
+				p.delivered.push_back(h);
+			if (failed.count(h))
+				p.failed.push_back(h);
+			if (send_failed.count(h))
+				p.send_failed.push_back(h);
+		}
+		p.part = (long long)k + 1;
+		p.parts = (long long)chunks.size();
+		ok &= record(journal_line(event_to_json(p)), sync && k + 1 == chunks.size());
+	}
+	return ok;
 }
 
 bool Store::console_record_type(const std::string &type) {
@@ -1761,8 +1992,12 @@ void Store::record_console(json j) {
 	if (!j.contains("ts"))
 		j["ts"] = now_ts();
 	j["src"] = "console";
+	// Text from a model, a sensor or a request may not be valid UTF-8: write
+	// it with U+FFFD rather than throw and lose the record.
+	std::string line = journal_line(j);
 	std::unique_lock lk(mu_);
-	record(j.dump());
+	if (!record(line))
+		throw std::runtime_error("the journal is closed (the console is stopping); record not written");
 }
 
 std::vector<Event> Store::alerts_copy() {

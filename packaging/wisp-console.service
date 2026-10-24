@@ -1,7 +1,11 @@
 [Unit]
 Description=Wisp fleet console
 Documentation=file:/usr/local/share/doc/wisp/docs/console.md
-After=network-online.target
+# time-sync.target: certificate validity, token and journal timestamps need
+# a correct clock. It is a passive target (ordering only, not pulled in); it
+# waits for a synchronised clock only if systemd-time-wait-sync.service (or
+# your NTP client's equivalent) is enabled.
+After=network-online.target time-sync.target
 Wants=network-online.target
 
 [Service]
@@ -29,7 +33,9 @@ EnvironmentFile=-/etc/wisp/console.env
 #     LoadCredential=vault.key:/etc/wisp/console/vault.key
 #     Environment=WISP_VAULT_KEY_FILE=/run/credentials/wisp-console.service/vault.key
 #   and pass -ai-key-file /run/credentials/wisp-console.service/anthropic.key
-#   in WISP_EXTRA.
+#   in WISP_EXTRA. The vault key must be at least 32 characters of random
+#   key material, e.g.:
+#     (umask 077; openssl rand -base64 32 > /etc/wisp/console/vault.key)
 LoadCredential=console.crt:/etc/wisp/console/console.crt
 LoadCredential=console.key:/etc/wisp/console/console.key
 LoadCredential=sensor-ca.crt:/etc/wisp/console/sensor-ca.crt
@@ -40,6 +46,17 @@ ExecStart=/usr/local/bin/wisp-console \
   -client-ca ${CREDENTIALS_DIRECTORY}/sensor-ca.crt \
   -roles ${CREDENTIALS_DIRECTORY}/roles.conf \
   -state-dir ${STATE_DIRECTORY} $WISP_EXTRA
+# Reload: SIGHUP makes the console re-read roles.conf (tokens), keeping the
+# previous tokens if the new file is invalid. roles.conf reaches the service
+# as a credential, i.e. a COPY made when the service starts. systemd >= 260
+# refreshes that copy on reload (RefreshOnReload=credentials below); older
+# systemd (Ubuntu 24.04: 255, Debian 12 / RHEL 9: 252) ignores the setting
+# with a warning and re-copies only on restart, so there
+#   systemctl restart wisp-console     # after editing roles.conf
+# (sensors reconnect within seconds; the journal is replayed). The log line
+# "roles: reloaded ... (N token(s))" shows what a reload actually loaded.
+ExecReload=/bin/kill -HUP $MAINPID
+RefreshOnReload=credentials
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=20
@@ -63,7 +80,8 @@ MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 CapabilityBoundingSet=
 LimitNOFILE=65536
-# Each sensor connection holds a thread: keep this above -max-sensors.
+# Each sensor connection holds a thread: keep this above -max-sensors
+# (default 16384) plus ~1100 for the HTTP, analysis and journal threads.
 TasksMax=20480
 
 [Install]

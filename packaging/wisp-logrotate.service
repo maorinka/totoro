@@ -1,0 +1,12 @@
+[Unit]
+Description=Rotate Wisp sensor logs (size check between the daily logrotate runs)
+Documentation=file:/usr/local/share/doc/wisp/docs/operations.md
+ConditionPathExists=/etc/logrotate.d/wisp
+
+[Service]
+Type=oneshot
+# Same state file as the system logrotate run (the compiled-in default), so
+# the daily/weekly schedule is shared and only maxsize adds rotations.
+ExecStart=/usr/sbin/logrotate /etc/logrotate.d/wisp
+Nice=19
+IOSchedulingClass=idle

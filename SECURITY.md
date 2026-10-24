@@ -11,6 +11,7 @@ acknowledge reports within three working days.
 
 | Version | Supported |
 |---|---|
+| 1.1.x | Yes |
 | 1.0.x | Yes |
 | 0.x | No |
 

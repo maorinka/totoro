@@ -1,0 +1,11 @@
+[Unit]
+Description=Hourly size check for Wisp sensor logs
+Documentation=file:/usr/local/share/doc/wisp/docs/operations.md
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

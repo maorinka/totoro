@@ -7,7 +7,10 @@
 // CR or LF, obs-fold, whitespace before a colon, a missing or repeated Host,
 // and a Content-Length that is not plain digits are refused with 400, so a
 // front proxy and this server can never disagree about where a request ends.
-// Errors the server writes itself carry a JSON {"error": "..."} body.
+// Errors the server writes itself carry a JSON {"error": "..."} body (none
+// for HEAD) and the same security headers as every other response. A path
+// with an encoded '/' (%2F) is refused: routes match the decoded path, which
+// must not join segments the client sent as one.
 #pragma once
 
 #include <atomic>
@@ -53,6 +56,9 @@ using Precheck = std::function<bool(const Request &, Response &)>;
 
 // Percent-decoding with '+' as space; parses a query string into a Query.
 std::string url_decode(const std::string &s, bool plus_as_space);
+// The headers every response carries, the server's own errors included:
+// CSP, nosniff, framing, referrer and opener policies, and HSTS over TLS.
+void security_headers(Response &r, bool tls);
 Query parse_query(const std::string &q);
 const char *status_text(int code);
 
@@ -70,9 +76,13 @@ public:
 	int active() const { return active_; }
 	std::atomic<bool> stopping{false};
 	static constexpr int max_conns = 1024;
-	// Per client address (IPv6: per /64), so one client cannot take every
-	// slot. Loopback is exempt: a local reverse proxy carries every user.
-	int max_conns_per_source = 256;
+	// Per client address (IPv6: per /64), so one client -- or a handful --
+	// cannot take every slot: it takes at least 16 sources to fill the server.
+	int max_conns_per_source = max_conns / 16;
+	// Loopback clients are limited like any other unless this is set (a
+	// reverse proxy on this machine, whose connections carry every user).
+	// X-Forwarded-For is never trusted.
+	bool exempt_loopback = false;
 	// From the end of the TLS handshake to the end of the first request's headers.
 	std::atomic<std::chrono::milliseconds> first_request{std::chrono::seconds(10)};
 	Precheck precheck;  // optional; set before serve()

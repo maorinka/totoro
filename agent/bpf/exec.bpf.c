@@ -2,11 +2,11 @@
 /* Wisp exec sensor (eBPF).
  *
  * Captures every successful program execution in the kernel and pushes a
- * complete record (pid, ppid, uid, parent comm, tty, filename, argv) into a
- * ring buffer. Because the data is captured in-kernel at exec time,
- * userspace can drain the ring buffer lazily and in batches without ever
- * racing a short-lived process that has already exited -- the flaw that
- * makes a /proc-reading sensor miss fast processes when it batches.
+ * complete record (pid, ppid, start times, uid, comm, parent comm, tty,
+ * filename, argv) into a ring buffer. Because the data is captured in-kernel
+ * at exec time, userspace can drain the ring buffer lazily and in batches
+ * without ever racing a short-lived process that has already exited -- the
+ * flaw that makes a /proc-reading sensor miss fast processes when it batches.
  *
  * The hook is the sched_process_exec tracepoint, which fires once per
  * successful exec whatever the entry point: execve, execveat, fexecve (glibc
@@ -56,6 +56,9 @@ struct exec_event {
 	__u64 key;                  /* hash of the whole exec context (see below) */
 	__u32 flags;                /* EV_* */
 	__u32 pad;
+	__u64 start_ns;             /* process start, ns since boot (see task_start_ns) */
+	__u64 pstart_ns;            /* the parent's */
+	char  comm[COMM_LEN];       /* the kernel's comm for the new program */
 	char  pcomm[COMM_LEN];      /* parent's comm */
 	char  exe_name[NAME_LEN];   /* executable's dentry name (EV_FDPATH only) */
 	char  filename[FNAME_LEN];
@@ -144,6 +147,23 @@ static __always_inline __u64 tail_mask(__u32 rem)
 	return rem >= 8 ? ~0ULL : (1ULL << (rem * 8)) - 1;
 }
 
+/* Kernels before 5.5 call the boot-based start time real_start_time. */
+struct task_struct___old {
+	__u64 real_start_time;
+} __attribute__((preserve_access_index));
+
+/* A process's start time in ns since boot (suspend included) -- the value
+ * /proc/<pid>/stat field 22 is derived from (ns / (1e9 / USER_HZ)). It never
+ * changes for a process and no two processes that held one pid share it, so
+ * userspace re-checks it before signalling a pid taken from this event. */
+static __always_inline __u64 task_start_ns(struct task_struct *t)
+{
+	struct task_struct *g = BPF_CORE_READ(t, group_leader);
+	if (bpf_core_field_exists(g->start_boottime))
+		return BPF_CORE_READ(g, start_boottime);
+	return BPF_CORE_READ((struct task_struct___old *)g, real_start_time);
+}
+
 SEC("tracepoint/sched/sched_process_exec")
 int wisp_exec(struct trace_event_raw_sched_process_exec *ctx)
 {
@@ -159,6 +179,10 @@ int wisp_exec(struct trace_event_raw_sched_process_exec *ctx)
 	e->ppid = BPF_CORE_READ(parent, tgid);
 	e->flags = BPF_CORE_READ(task, signal, tty) ? EV_TTY : 0;
 	e->pad = 0;
+	e->start_ns = task_start_ns(task);
+	e->pstart_ns = task_start_ns(parent);
+	__builtin_memset(e->comm, 0, sizeof e->comm);
+	bpf_get_current_comm(e->comm, sizeof e->comm);
 	__builtin_memset(e->pcomm, 0, sizeof e->pcomm);
 	bpf_probe_read_kernel_str(e->pcomm, sizeof e->pcomm, &parent->comm);
 	__u64 gcomm[COMM_LEN / 8] = {};   /* word-aligned for the hash below */
@@ -205,8 +229,8 @@ int wisp_exec(struct trace_event_raw_sched_process_exec *ctx)
 	e->arg_len = len;
 
 	/* Context key: keyed hash over everything a rule can see about this
-	 * exec except the inherited actor -- filename, argv, uid, tty, parent
-	 * comm -- plus the grandparent's comm, which separates the same command
+	 * exec except the inherited actor -- filename, argv, uid, tty, comm,
+	 * parent comm -- plus the grandparent's comm, which separates the same command
 	 * run under different launchers (a login shell vs an agent's shell).
 	 * Lengths are absorbed too, so field boundaries are unambiguous. */
 	struct sip st = {
@@ -229,6 +253,8 @@ int wisp_exec(struct trace_event_raw_sched_process_exec *ctx)
 	}
 	sip_block(&st, len);
 	sip_block(&st, (__u64)e->uid | (__u64)(e->flags & (EV_TTY | EV_ARGS_TRUNC | EV_ARGS_FAULT)) << 32);
+	sip_block(&st, *(__u64 *)&e->comm[0]);
+	sip_block(&st, *(__u64 *)&e->comm[8]);
 	sip_block(&st, *(__u64 *)&e->pcomm[0]);
 	sip_block(&st, *(__u64 *)&e->pcomm[8]);
 	sip_block(&st, gcomm[0]);
@@ -275,6 +301,7 @@ int wisp_exec(struct trace_event_raw_sched_process_exec *ctx)
 struct conn_event {
 	__u32 pid;
 	__u32 uid;
+	__u64 start_ns;             /* the connecting process's start (task_start_ns) */
 	__u16 dport;
 	__u16 family;
 	__u32 daddr4;
@@ -302,6 +329,7 @@ int wisp_connect(struct trace_event_raw_inet_sock_set_state *ctx)
 		return 0;
 	e->pid = tgid;
 	e->uid = bpf_get_current_uid_gid();
+	e->start_ns = task_start_ns((struct task_struct *)bpf_get_current_task());
 	e->dport = ctx->dport;
 	e->family = ctx->family;
 	if (ctx->family == AF_INET)

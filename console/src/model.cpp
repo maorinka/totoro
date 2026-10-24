@@ -99,6 +99,11 @@ Event event_from_json(const json &j) {
 	get_str(j, "src", e.src);
 	get_bool(j, "id_kept", e.id_kept);
 	get_strs(j, "send_failed", e.send_failed);
+	get_str(j, "cert_fp", e.cert_fp);
+	get_str(j, "cert_name", e.cert_name);
+	get_bool(j, "cert_refused", e.cert_refused);
+	get_int(j, "part", e.part);
+	get_int(j, "parts", e.parts);
 	return e;
 }
 
@@ -159,6 +164,12 @@ json event_to_json(const Event &e) {
 	if (e.id_kept)
 		j["id_kept"] = true;
 	a("send_failed", e.send_failed);
+	s("cert_fp", e.cert_fp);
+	s("cert_name", e.cert_name);
+	if (e.cert_refused)
+		j["cert_refused"] = true;
+	i("part", e.part);
+	i("parts", e.parts);
 	return j;
 }
 

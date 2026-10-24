@@ -40,9 +40,18 @@ struct Event {
 	//   id_kept - on a hello: the console refused the identity it presented
 	//   send_failed - on a rollout: cohort hosts that were connected but whose
 	//             control write failed or timed out (a subset of failed)
+	//   cert_fp, cert_name - on a hello: SHA-256 of the client certificate the
+	//             connection presented, and its subject (CN, then SANs)
+	//   cert_refused - on a hello: the certificate differed from the one
+	//             recorded for the host, which kept its recorded certificate
+	//   part, parts - a rollout / rollout_intent record split in parts (1-based)
+	//             so no journal line exceeds what older consoles can replay
 	std::string rx_ts, src;
 	bool id_kept = false;
 	std::vector<std::string> send_failed;
+	std::string cert_fp, cert_name;
+	bool cert_refused = false;
+	long long part = 0, parts = 0;
 };
 
 // Decode from a sensor or journal line. Unknown fields are ignored; a field of
@@ -62,6 +71,9 @@ struct Host {
 	std::string mode, state, decommissioned;
 	TimePoint decommissioned_at{};
 	long long dropped_lines = 0;  // sensor lines refused (rate limit, oversize)
+	// The client certificate first seen for this host (SHA-256 hex, subject):
+	// a connection presenting another one never receives its control lines.
+	std::string cert_fp, cert_name;
 
 	// In-memory only (not serialised): liveness on the monotonic clock, so a
 	// wall-clock step never makes a live host look silent (or a dead one

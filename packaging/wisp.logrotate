@@ -1,5 +1,18 @@
-# Wisp sensor logs. The sensor keeps its log files open with O_APPEND, so
-# copytruncate is safe: no lines are lost or interleaved at rotation.
+# Wisp sensor logs. logrotate renames each file and creates an empty one;
+# postrotate sends wispd SIGHUP, on which it flushes buffered telemetry to
+# the old file and reopens every log by name (out_reopen). Nothing is lost
+# between the rename and the reopen: until then wispd keeps appending to the
+# renamed file, which delaycompress leaves uncompressed until the next run.
+# Note that alerts.jsonl is the only copy of alerts the sensor could not
+# deliver while disconnected.
+#
+# SIGHUP also reloads policy (rules, catalog, netpolicy, FIM), the same as
+# `systemctl reload wispd`.
+#
+# maxsize is only evaluated when logrotate runs. The system runs it daily;
+# install.sh also enables wisp-logrotate.timer, which runs this file hourly,
+# so a log can grow by at most about one hour of output past maxsize.
+#
 # telemetry.jsonl (one line per exec) is the large one; alerts and inventory
 # are kept longer because they are the audit record.
 /var/log/wisp/telemetry.jsonl {
@@ -10,7 +23,11 @@
 	delaycompress
 	missingok
 	notifempty
-	copytruncate
+	create 0640 root root
+	sharedscripts
+	postrotate
+		systemctl kill -s HUP --kill-whom=main wispd.service >/dev/null 2>&1 || true
+	endscript
 }
 
 /var/log/wisp/alerts.jsonl /var/log/wisp/inventory.jsonl {
@@ -21,5 +38,9 @@
 	delaycompress
 	missingok
 	notifempty
-	copytruncate
+	create 0640 root root
+	sharedscripts
+	postrotate
+		systemctl kill -s HUP --kill-whom=main wispd.service >/dev/null 2>&1 || true
+	endscript
 }

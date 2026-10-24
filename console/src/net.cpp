@@ -137,6 +137,62 @@ void Stream::close_gracefully(Deadline dl) {
 	}
 }
 
+bool Stream::peer_cert(std::string *fingerprint, std::string *subject) {
+	if (!ssl_)
+		return false;
+	X509 *x = nullptr;
+	{
+		std::lock_guard g(mu_);
+		x = SSL_get1_peer_certificate(ssl_);
+	}
+	if (!x)
+		return false;
+	unsigned char md[EVP_MAX_MD_SIZE];
+	unsigned int n = 0;
+	bool ok = X509_digest(x, EVP_sha256(), md, &n) == 1;
+	if (ok) {
+		static const char hexd[] = "0123456789abcdef";
+		fingerprint->clear();
+		for (unsigned int i = 0; i < n; i++) {
+			*fingerprint += hexd[md[i] >> 4];
+			*fingerprint += hexd[md[i] & 15];
+		}
+		std::string sub;
+		char cn[256] = "";
+		if (X509_NAME_get_text_by_NID(X509_get_subject_name(x), NID_commonName, cn, sizeof cn) > 0)
+			sub = std::string("CN=") + cn;
+		if (auto *sans = static_cast<GENERAL_NAMES *>(X509_get_ext_d2i(x, NID_subject_alt_name, nullptr, nullptr))) {
+			for (int i = 0; i < sk_GENERAL_NAME_num(sans); i++) {
+				const GENERAL_NAME *g = sk_GENERAL_NAME_value(sans, i);
+				std::string v;
+				if (g->type == GEN_DNS) {
+					v = "DNS:" + std::string(reinterpret_cast<const char *>(ASN1_STRING_get0_data(g->d.dNSName)),
+					                         (size_t)ASN1_STRING_length(g->d.dNSName));
+				} else if (g->type == GEN_IPADD) {
+					char ip[INET6_ADDRSTRLEN] = "";
+					int len = ASN1_STRING_length(g->d.iPAddress);
+					const unsigned char *b = ASN1_STRING_get0_data(g->d.iPAddress);
+					if (len == 4 || len == 16)
+						inet_ntop(len == 4 ? AF_INET : AF_INET6, b, ip, sizeof ip);
+					v = std::string("IP:") + ip;
+				} else {
+					continue;
+				}
+				sub += (sub.empty() ? "" : ",") + v;
+			}
+			GENERAL_NAMES_free(sans);
+		}
+		// Certificate text is the CA's, but keep it printable and bounded:
+		// it reaches alerts and the journal.
+		for (auto &c : sub)
+			if ((unsigned char)c < 0x20 || c == 0x7f)
+				c = '?';
+		*subject = sub.substr(0, 512);
+	}
+	X509_free(x);
+	return ok;
+}
+
 // Wait for the socket, in slices so a shutdown() from another thread is noticed.
 int Stream::wait(short events, Deadline dl) {
 	for (;;) {
@@ -799,8 +855,19 @@ HttpsResponse https_request(const std::string &method, const std::string &url, c
 		::close(fd);
 		return out;
 	}
-	SSL_set_tlsext_host_name(ssl, u.host.c_str());
-	SSL_set1_host(ssl, u.host.c_str());
+	// An IP-literal URL is verified against the certificate's IP SANs and
+	// sends no SNI (RFC 6066 forbids an address there); a name is verified
+	// as a DNS name and sent as SNI.
+	unsigned char ipbuf[sizeof(struct in6_addr)];
+	bool ip_literal = inet_pton(AF_INET, u.host.c_str(), ipbuf) == 1 || inet_pton(AF_INET6, u.host.c_str(), ipbuf) == 1;
+	bool named = ip_literal ? X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), u.host.c_str()) == 1
+	                        : SSL_set_tlsext_host_name(ssl, u.host.c_str()) == 1 && SSL_set1_host(ssl, u.host.c_str()) == 1;
+	if (!named) {
+		out.error = "TLS: cannot verify host " + u.host + ": " + ssl_err();
+		SSL_free(ssl);
+		::close(fd);
+		return out;
+	}
 	auto finish = [&](const std::string &e) {
 		if (!e.empty()) {
 			out.error = e;

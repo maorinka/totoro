@@ -149,17 +149,53 @@ static bool has_token(const std::string &list, const char *want) {
 	return false;
 }
 
-// An error the server answers itself: JSON, like the API's own errors.
-static std::string error_response(int code, const std::string &msg, bool head = false) {
-	std::string b = json{{"error", msg}}.dump() + "\n";
-	return "HTTP/1.1 " + std::to_string(code) + " " + status_text(code) +
-	       "\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n"
-	       "Date: " + http_date() + "\r\nConnection: close\r\nContent-Length: " + std::to_string(b.size()) + "\r\n\r\n" +
-	       (head ? "" : b);
+void security_headers(Response &r, bool tls) {
+	r.set("Content-Security-Policy",
+	      "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; "
+	      "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'");
+	r.set("X-Content-Type-Options", "nosniff");
+	r.set("X-Frame-Options", "DENY");
+	r.set("Referrer-Policy", "no-referrer");
+	r.set("Cross-Origin-Opener-Policy", "same-origin");
+	if (tls)
+		r.set("Strict-Transport-Security", "max-age=31536000");
+}
+
+// The status line, headers and (unless HEAD) body of a response.
+static std::string serialize(Response &resp, bool head) {
+	std::string out = "HTTP/1.1 " + std::to_string(resp.status) + " " + status_text(resp.status) + "\r\n";
+	if (resp.get("Content-Type").empty() && !resp.body.empty())
+		resp.set("Content-Type", "text/plain; charset=utf-8");
+	resp.set("Date", http_date());
+	resp.set("Content-Length", std::to_string(resp.body.size()));
+	for (auto &[k, v] : resp.headers)
+		out += k + ": " + v + "\r\n";
+	out += "\r\n";
+	if (!head)
+		out += resp.body;
+	return out;
+}
+
+// An error the server answers itself: JSON, like the API's own errors, with
+// the security headers every response carries.
+static Response error_body(int code, const std::string &msg, bool tls) {
+	Response r;
+	r.status = code;
+	security_headers(r, tls);
+	r.set("Content-Type", "application/json");
+	r.set("Cache-Control", "no-store");
+	r.body = json{{"error", msg}}.dump(-1, ' ', false, json::error_handler_t::replace) + "\n";
+	return r;
+}
+
+static std::string error_response(int code, const std::string &msg, bool tls, bool head) {
+	Response r = error_body(code, msg, tls);
+	r.set("Connection", "close");
+	return serialize(r, head);
 }
 
 // The client's address for per-source limits: IPv4 address, or the /64 of
-// an IPv6 one; "" for loopback (exempt) or when unknown.
+// an IPv6 one; "lo" for loopback; "" when unknown.
 static std::string source_key(int fd) {
 	struct sockaddr_storage ss {};
 	socklen_t len = sizeof ss;
@@ -172,7 +208,7 @@ static std::string source_key(int fd) {
 		auto *a6 = &reinterpret_cast<struct sockaddr_in6 *>(&ss)->sin6_addr;
 		const unsigned char *x = a6->s6_addr;
 		if (IN6_IS_ADDR_LOOPBACK(a6))
-			return "";
+			return "lo";
 		if (!IN6_IS_ADDR_V4MAPPED(a6))
 			return hex_encode(x, 8);  // the /64
 		b = x + 12;
@@ -180,7 +216,7 @@ static std::string source_key(int fd) {
 		return "";
 	}
 	if (b[0] == 127)
-		return "";
+		return "lo";
 	return std::to_string(b[0]) + "." + std::to_string(b[1]) + "." + std::to_string(b[2]) + "." + std::to_string(b[3]);
 }
 
@@ -204,6 +240,8 @@ void HttpServer::serve(Listener &ln, milliseconds drain) {
 			continue;
 		}
 		std::string src = source_key(fd);
+		if (src == "lo" && exempt_loopback)
+			src.clear();
 		if (!src.empty()) {
 			std::lock_guard g(mu_);
 			int &n = per_source_[src];
@@ -283,7 +321,10 @@ void HttpServer::connection(int fd) {
 	} linger{s};
 	if (!s.handshake(after(seconds(10))))
 		return;
-	auto fail = [&](int code, const std::string &msg) { s.write_all(error_response(code, msg), after(seconds(5))); };
+	bool head_req = false;  // the request being answered is a HEAD (known once its request line is parsed)
+	auto fail = [&](int code, const std::string &msg) {
+		s.write_all(error_response(code, msg, s.tls(), head_req), after(seconds(5)));
+	};
 	std::string buf;
 	char chunk[16384];
 	bool first = true;
@@ -343,12 +384,14 @@ void HttpServer::connection(int fd) {
 
 		Request req;
 		req.tls = s.tls();
+		head_req = false;
 		size_t le = head.find("\r\n");
 		std::string line = head.substr(0, le);
 		auto sp1 = line.find(' '), sp2 = line.rfind(' ');
 		if (sp1 == std::string::npos || sp2 == sp1 || line.find(' ', sp1 + 1) != sp2)
 			return fail(400, "malformed request line");
 		req.method = line.substr(0, sp1);
+		head_req = req.method == "HEAD";
 		std::string target = line.substr(sp1 + 1, sp2 - sp1 - 1), proto = line.substr(sp2 + 1);
 		if (proto != "HTTP/1.1" && proto != "HTTP/1.0")
 			return fail(400, "unsupported protocol version");
@@ -364,7 +407,13 @@ void HttpServer::connection(int fd) {
 		if (target.empty() || (target[0] != '/' && !(target == "*" && req.method == "OPTIONS")))
 			return fail(400, "malformed request target");
 		auto qm = target.find('?');
-		req.path = url_decode(target.substr(0, qm), false);
+		std::string raw_path = target.substr(0, qm);
+		// Routes match the decoded path: an encoded '/' would let /api%2Fvault
+		// reach /api/vault past anything in front that matches the raw path.
+		for (size_t i = 0; i + 2 < raw_path.size(); i++)
+			if (raw_path[i] == '%' && raw_path[i + 1] == '2' && (raw_path[i + 2] == 'f' || raw_path[i + 2] == 'F'))
+				return fail(400, "malformed request path: encoded '/'");
+		req.path = url_decode(raw_path, false);
 		for (unsigned char c : req.path)  // %00, %0a ...: never a route, never into a log line
 			if (c < 0x20 || c == 0x7f)
 				return fail(400, "malformed request path");
@@ -453,32 +502,18 @@ void HttpServer::connection(int fd) {
 				handler_(req, resp);
 			} catch (const std::exception &e) {
 				logf("http: %s %s: handler error: %s", req.method.c_str(), req.path.c_str(), e.what());
-				resp = Response{};
-				resp.status = 500;
-				resp.set("Content-Type", "application/json");
-				resp.set("Cache-Control", "no-store");
-				resp.set("X-Content-Type-Options", "nosniff");
-				resp.body = json{{"error", "internal error"}}.dump() + "\n";
+				resp = error_body(500, "internal error", req.tls);
 				keep_alive = false;
 			}
 		}
 
 		if (stopping)
 			keep_alive = false;
-		std::string out = "HTTP/1.1 " + std::to_string(resp.status) + " " + status_text(resp.status) + "\r\n";
-		if (resp.get("Content-Type").empty() && !resp.body.empty())
-			resp.set("Content-Type", "text/plain; charset=utf-8");
-		resp.set("Date", http_date());
-		resp.set("Content-Length", std::to_string(resp.body.size()));
 		if (!keep_alive)
 			resp.set("Connection", "close");
 		else if (proto == "HTTP/1.0")
 			resp.set("Connection", "keep-alive");
-		for (auto &[k, v] : resp.headers)
-			out += k + ": " + v + "\r\n";
-		out += "\r\n";
-		if (req.method != "HEAD")
-			out += resp.body;
+		std::string out = serialize(resp, head_req);
 		if (!s.write_all(out, after(WRITE)) || !keep_alive)
 			return;
 	}

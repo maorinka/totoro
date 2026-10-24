@@ -57,12 +57,13 @@
     </nav>
     <div class="side-foot"><span class="who" id="who"></span></div>
   </aside>
+  <div class="nav-backdrop" id="nav-backdrop" hidden></div>
   <div class="mainwrap">
     <header class="top">
       <button class="iconbtn only-narrow" id="menu" aria-label="Open navigation" aria-expanded="false" aria-controls="side"><svg class="ic"><use href="#i-menu"/></svg></button>
       <h1 id="title">Overview</h1>
       <div class="top-right">
-        <span class="live" id="live" role="status" aria-live="polite"></span>
+        <span class="live" id="live"></span><span class="sr-only" id="live-sr" role="status" aria-live="polite"></span>
         <button class="iconbtn" id="pause" aria-label="Pause auto-refresh" title="Pause auto-refresh"><svg class="ic"><use href="#i-pause"/></svg></button>
         <button class="iconbtn" id="theme" aria-label="Toggle colour theme" title="Toggle colour theme"><svg class="ic"><use href="#i-moon"/></svg></button>
       </div>
@@ -86,14 +87,14 @@
 </div>
 
 <div id="drawer" class="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title" hidden>
-  <div class="drawer-panel">
+  <div class="drawer-panel" tabindex="-1">
     <header><h2 id="drawer-title"></h2><button class="iconbtn" id="drawer-close" aria-label="Close"><svg class="ic"><use href="#i-close"/></svg></button></header>
     <div class="drawer-body" id="drawer-body"></div>
   </div>
 </div>
 
 <div id="confirm" class="modal" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-body" hidden>
-  <div class="modal-card">
+  <div class="modal-card" tabindex="-1">
     <h2 id="confirm-title"></h2>
     <div id="confirm-body"></div>
     <div class="row end"><button class="btn" id="confirm-no">Cancel</button><button class="btn primary" id="confirm-yes">Confirm</button></div>

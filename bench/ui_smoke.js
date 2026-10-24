@@ -38,8 +38,15 @@ async function settle(p) {
 }
 const ROUTES = ['/', '/incidents', '/suggestions', '/analysis', '/alerts', '/hosts', '/investigate?host=web-01', '/vulnerabilities', '/posture', '/rollouts', '/settings'];
 
+async function whoami(tok) {
+  const r = await fetch(BASE + '/api/me', { headers: { Authorization: 'Bearer ' + tok } });
+  if (!r.ok) throw new Error(`/api/me with the admin token: HTTP ${r.status}`);
+  return (await r.json()).name;
+}
+
 (async () => {
   const browser = await chromium.launch();
+  const adminName = await whoami(admin);
 
   // --- sign-in flow -------------------------------------------------------
   {
@@ -73,10 +80,36 @@ const ROUTES = ['/', '/incidents', '/suggestions', '/analysis', '/alerts', '/hos
     await c.close();
   }
 
+  // --- viewer role: no write controls -------------------------------------
+  {
+    const { c, p } = await ctx(browser, { tag: 'viewer' });
+    await signIn(p, viewer);
+    await p.goto(BASE + '/rollouts'); await settle(p);
+    (await p.$('button:has-text("Start rollout")')) ? report('viewer sees Start rollout') : ok('viewer: rollout planner hidden');
+    await p.goto(BASE + '/alerts?status=all'); await settle(p);
+    await p.click('#main tbody tr.clickable >> nth=0'); await p.waitForSelector('#drawer-body h3');
+    (await p.$('#drawer-body button:has-text("Resolve")')) ? report('viewer sees triage buttons') : ok('viewer: triage read-only');
+    await p.keyboard.press('Escape');
+    await p.goto(BASE + '/suggestions'); await settle(p);
+    const nSugg = await p.locator('.sugg').count();
+    if (!nSugg) report('viewer: no suggestions waiting, so read-only approval could not be checked (seed data with bench/demo_fleet.py)');
+    else (await p.$('.sugg button.primary:not([disabled])')) ? report('viewer can approve suggestions') : ok(`viewer: ${nSugg} suggestion(s) shown read-only`);
+    await c.close();
+  }
+
   // --- interactions as admin ----------------------------------------------
   {
     const { c, p } = await ctx(browser, { tag: 'interact' });
     await signIn(p, admin);
+    // navigating while the previous page is still loading must show the new page
+    await p.route('**/api/incidents?*', async (route) => { await new Promise((r) => setTimeout(r, 1500)); await route.continue(); });
+    await p.goto(BASE + '/'); await p.waitForSelector('#app:not([hidden])');
+    await p.click('.side nav a[data-route="alerts"]');
+    await p.waitForTimeout(2500);
+    const raced = await p.evaluate(() => ({ alerts: !!document.querySelector('#alert-q'), kpis: !!document.querySelector('#main .kpis'), title: document.querySelector('#title').textContent }));
+    (raced.alerts && !raced.kpis && raced.title === 'Alerts') ? ok('navigation during an in-flight load shows the new page') : report('navigation race: ' + JSON.stringify(raced));
+    await p.unroute('**/api/incidents?*');
+    await p.goto(BASE + '/'); await settle(p);
     // keyboard nav
     await p.keyboard.press('g'); await p.keyboard.press('a');
     await p.waitForURL('**/alerts'); await settle(p);
@@ -95,7 +128,7 @@ const ROUTES = ['/', '/incidents', '/suggestions', '/analysis', '/alerts', '/hos
     await p.click('#drawer-body button:has-text("Acknowledge")');
     await p.waitForSelector('#toast:not([hidden])');
     const st = await p.evaluate(async ([id, tok]) => { const r = await fetch('/api/alerts?status=all&limit=5000', { headers: { Authorization: 'Bearer ' + tok } }); return (await r.json()).find((a) => a.id === id); }, [id, admin]);
-    (st && st.status === 'acknowledged' && st.note.includes('red-team') && st.triaged_by === 'Ada Lovelace') ? ok(`triage persisted (${id} acknowledged by ${st.triaged_by})`) : report('triage: ' + JSON.stringify(st));
+    (st && st.status === 'acknowledged' && st.note.includes('red-team') && st.triaged_by === adminName) ? ok(`triage persisted (${id} acknowledged by ${st.triaged_by})`) : report('triage: ' + JSON.stringify(st));
     await p.screenshot({ path: `${shots}/alert-drawer.png` });
     await p.keyboard.press('Escape');
     (await p.isHidden('#drawer')) ? ok('Esc closes drawer') : report('drawer still open after Esc');
@@ -135,6 +168,11 @@ const ROUTES = ['/', '/incidents', '/suggestions', '/analysis', '/alerts', '/hos
     await p.keyboard.press('Escape');
     // suggestions: approving one is carried out and recorded
     await p.goto(BASE + '/suggestions'); await settle(p);
+    const aiCards = await p.locator('.sugg.from-ai').count();
+    if (aiCards) {
+      const labelled = await p.locator('.sugg.from-ai .ai-notice').count();
+      labelled === aiCards ? ok(`${aiCards} AI suggestion(s) labelled "review before approving"`) : report(`AI suggestions without the review label: ${aiCards - labelled}`);
+    }
     const first = p.locator('.sugg').first();
     if (await first.count()) {
       const title = await first.locator('b.grow').textContent();
@@ -143,23 +181,8 @@ const ROUTES = ['/', '/incidents', '/suggestions', '/analysis', '/alerts', '/hos
       await p.click('#confirm-yes');
       await p.waitForSelector('#toast:not([hidden])');
       const done = await p.evaluate(async ([tok, t]) => (await (await fetch('/api/suggestions?status=all', { headers: { Authorization: 'Bearer ' + tok } })).json()).find((x) => x.title === t), [admin, title]);
-      (done && ['applied', 'accepted', 'failed'].includes(done.status) && done.decided_by === 'Ada Lovelace') ? ok(`suggestion "${title}" ${done.status} by ${done.decided_by}`) : report('suggestion approval: ' + JSON.stringify(done));
+      (done && ['applied', 'accepted'].includes(done.status) && done.decided_by === adminName) ? ok(`suggestion "${title}" ${done.status} by ${done.decided_by}`) : report('suggestion approval: ' + JSON.stringify(done));
     } else ok('no suggestions waiting (nothing to approve)');
-    await c.close();
-  }
-
-  // --- viewer role: no write controls -------------------------------------
-  {
-    const { c, p } = await ctx(browser, { tag: 'viewer' });
-    await signIn(p, viewer);
-    await p.goto(BASE + '/rollouts'); await settle(p);
-    (await p.$('button:has-text("Start rollout")')) ? report('viewer sees Start rollout') : ok('viewer: rollout planner hidden');
-    await p.goto(BASE + '/alerts?status=all'); await settle(p);
-    await p.click('#main tbody tr.clickable >> nth=0'); await p.waitForSelector('#drawer-body h3');
-    (await p.$('#drawer-body button:has-text("Resolve")')) ? report('viewer sees triage buttons') : ok('viewer: triage read-only');
-    await p.keyboard.press('Escape');
-    await p.goto(BASE + '/suggestions'); await settle(p);
-    (await p.$('.sugg button.primary:not([disabled])')) ? report('viewer can approve suggestions') : ok('viewer: suggestions read-only');
     await c.close();
   }
 

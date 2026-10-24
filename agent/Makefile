@@ -15,6 +15,9 @@ BPF_ARCH := $(patsubst aarch64,arm64,$(patsubst x86_64,x86,$(shell uname -m)))
 # One version for the whole product, from ../VERSION.
 VERSION := $(shell cat ../VERSION 2>/dev/null || echo dev)
 CFLAGS  += -DWISP_VERSION='"$(VERSION)"'
+# Reproducible builds: no build-directory paths in the binary (debug info,
+# __FILE__), so the same source gives the same bytes wherever it is built.
+CFLAGS  += -ffile-prefix-map=$(CURDIR)=.
 
 COMMON  := main.c util.c config.c actor.c rules.c catalog.c inventory.c fim.c respond.c output.c console.c pipeline.c identity.c governor.c ecosystem.c netpolicy.c patch.c anomaly.c forensics.c
 
@@ -56,7 +59,7 @@ bpf/vmlinux.h:
 	mv -f $@.tmp $@
 
 bpf/exec.bpf.o: bpf/exec.bpf.c bpf/vmlinux.h
-	$(CLANG) -O2 -g -Wall -target bpf -D__TARGET_ARCH_$(BPF_ARCH) -Ibpf -c $< -o $@
+	$(CLANG) -O2 -g -Wall -ffile-prefix-map=$(CURDIR)=. -target bpf -D__TARGET_ARCH_$(BPF_ARCH) -Ibpf -c $< -o $@
 
 bpf/exec.skel.h: bpf/exec.bpf.o
 	$(BPFTOOL) gen skeleton $< name exec_bpf > $@.tmp || { rm -f $@.tmp; false; }

@@ -306,7 +306,7 @@ void rule_fire(const struct rule *r, struct proc *p)
 				done = krc == 0 ? "kill" : "kill-failed";
 			}
 		} else {
-			done = respond_kill(p->pid, r->id) == 0 ? "kill" : "kill-failed";
+			done = respond_kill(p->pid, p->start, r->id) == 0 ? "kill" : "kill-failed";
 		}
 	} else if (r->action >= ACT_KILL) {
 		done = "would-block"; /* monitor mode: report what enforce would do */

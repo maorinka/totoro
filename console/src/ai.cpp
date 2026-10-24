@@ -13,9 +13,13 @@ using namespace std::chrono;
 
 namespace {
 
-const char *const API_VERSION = "2026-10-21";
+const char *const API_VERSION = "2023-06-01";  // the Messages API version header
 const char *const FALLBACK_BETA = "server-side-fallback-2026-07-01";
 const size_t MAX_TOOL_RESULT = 40000;
+const size_t MAX_ASK_TOOL_BYTES = 400000;  // all tool results of one question
+const size_t MAX_REDACT = 4096;            // bytes of one string that reach the model
+const size_t MAX_TRIAGE_ALERTS = 50;
+const size_t MAX_TRIAGE_PROMPT = 200000;   // bytes of fleet data in one triage prompt
 
 const char *const SYSTEM_PROMPT =
     "You are the analysis assistant inside Wisp, an endpoint detection and response (EDR) console. You help "
@@ -143,26 +147,25 @@ json tools() {
 }
 
 std::string truncate_json(const json &j) {
-	std::string s = j.dump();
+	std::string s = fence_json(j);
 	if (s.size() <= MAX_TOOL_RESULT)
 		return s;
 	if (j.is_array()) {
 		json cut = json::array();
 		size_t used = 2;
 		for (auto &e : j) {
-			auto d = e.dump();
+			auto d = fence_json(e);
 			if (used + d.size() + 1 > MAX_TOOL_RESULT - 200)
 				break;
 			used += d.size() + 1;
 			cut.push_back(e);
 		}
-		return json{{"items", cut},
-		            {"truncated", true},
-		            {"total", j.size()},
-		            {"note", "narrow the filters to see the rest"}}
-		    .dump();
+		return fence_json(json{{"items", cut},
+		                       {"truncated", true},
+		                       {"total", j.size()},
+		                       {"note", "narrow the filters to see the rest"}});
 	}
-	return s.substr(0, MAX_TOOL_RESULT) + "... [truncated]";
+	return utf8_prefix(s, MAX_TOOL_RESULT) + "... [truncated]";
 }
 
 std::string jstr(const json &j, const char *k) {
@@ -189,47 +192,345 @@ std::string severity_for(const std::string &verdict) {
 }  // namespace
 
 // ---- redaction ------------------------------------------------------------------------
+//
+// Hand-written scanners for everything that looks at long runs (URLs,
+// key=value pairs, high-entropy tokens): std::regex backtracks recursively, so
+// its stack depth and run time grow with the input, and a sensor can send long
+// fields. The remaining regexes start with a literal and see at most 4 KB.
+
+namespace {
+
+bool ident_char(char c) { return isalnum((unsigned char)c) || c == '_' || c == '-' || c == '.'; }
+
+// A key that names a secret: password, PGPASSWORD, AWS_SECRET_ACCESS_KEY,
+// api_key, x-auth-token, client_secret, sig ... but not PasswordAuthentication's
+// "no" (see the value check) or --author.
+bool secret_name(std::string_view ident) {
+	std::vector<std::string> parts;
+	std::string cur;
+	for (char c : ident) {
+		if (c == '_' || c == '-' || c == '.') {
+			if (!cur.empty())
+				parts.push_back(cur);
+			cur.clear();
+		} else {
+			cur += (char)tolower((unsigned char)c);
+		}
+	}
+	if (!cur.empty())
+		parts.push_back(cur);
+	for (size_t i = 0; i < parts.size(); i++) {
+		const std::string &p = parts[i];
+		for (auto w : {"password", "passwd", "passphrase", "secret", "token", "apikey", "credential", "privatekey",
+		               "accesskey"})
+			if (p.find(w) != std::string::npos)
+				return true;
+		if (p == "pass" || p == "pwd" || p == "auth" || p == "sig" || p == "signature")
+			return true;
+		if (p == "key" && i > 0 &&
+		    (parts[i - 1] == "api" || parts[i - 1] == "access" || parts[i - 1] == "private" || parts[i - 1] == "secret"))
+			return true;
+	}
+	return false;
+}
+
+// Values that are settings, not secrets (PasswordAuthentication=no).
+bool harmless_value(std::string_view v) {
+	static const std::set<std::string> ok = {"yes", "no", "true", "false", "on", "off", "none", "null"};
+	return v.empty() || ok.count(to_lower(v));
+}
+
+// key=value, key: value, "key": "value" and \"key\":\"value\" with a secret key.
+std::string redact_kv(const std::string &s) {
+	std::string out;
+	size_t copied = 0;
+	for (size_t p = 0; p < s.size(); p++) {
+		if (s[p] != '=' && s[p] != ':')
+			continue;
+		if (s[p] == ':' && s.compare(p, 3, "://") == 0)
+			continue;
+		size_t k = p;
+		while (k > copied && (s[k - 1] == ' ' || s[k - 1] == '\t'))
+			k--;
+		if (k > copied && (s[k - 1] == '"' || s[k - 1] == '\'')) {
+			k--;
+			if (k > copied && s[k - 1] == '\\')
+				k--;
+		}
+		size_t end = k;
+		while (k > copied && ident_char(s[k - 1]))
+			k--;
+		if (k == end || !secret_name(std::string_view(s).substr(k, end - k)))
+			continue;
+		size_t v = p + 1;
+		while (v < s.size() && (s[v] == ' ' || s[v] == '\t'))
+			v++;
+		if (s.compare(v, 10, "[REDACTED]") == 0)
+			continue;  // an earlier rule got it
+		size_t vb = v, ve;
+		if (s.compare(v, 2, "\\\"") == 0) {  // an escaped quote inside a JSON string
+			vb = v + 2;
+			ve = s.find("\\\"", vb);
+		} else if (v < s.size() && (s[v] == '"' || s[v] == '\'')) {
+			vb = v + 1;
+			ve = s.find(s[v], vb);
+		} else {
+			ve = v;
+			while (ve < s.size() && !isspace((unsigned char)s[ve]) && s[ve] != '&' && s[ve] != ';' && s[ve] != '"' &&
+			       s[ve] != '\'' && s[ve] != ',' && s[ve] != '}' && s[ve] != ']' && s[ve] != ')')
+				ve++;
+		}
+		if (ve == std::string::npos)
+			ve = s.size();
+		if (harmless_value(std::string_view(s).substr(vb, ve - vb)))
+			continue;
+		out.append(s, copied, vb - copied);
+		out += "[REDACTED]";
+		copied = ve;
+		p = ve > 0 ? ve - 1 : 0;
+	}
+	out.append(s, copied, std::string::npos);
+	return out;
+}
+
+// scheme://user:password@host, up to the last '@' of the authority (passwords
+// may contain '@').
+std::string redact_url_creds(const std::string &s) {
+	std::string out;
+	size_t copied = 0;
+	for (size_t p = s.find("://"); p != std::string::npos; p = s.find("://", p + 3)) {
+		size_t b = p;
+		while (b > 0 && (isalnum((unsigned char)s[b - 1]) || s[b - 1] == '+' || s[b - 1] == '.' || s[b - 1] == '-'))
+			b--;
+		if (b == p || !isalpha((unsigned char)s[b]) || p + 3 < copied)
+			continue;
+		size_t a = p + 3, e = a;
+		while (e < s.size() && !isspace((unsigned char)s[e]) && s[e] != '/' && s[e] != '?' && s[e] != '#' &&
+		       s[e] != '"' && s[e] != '\'')
+			e++;
+		size_t at = s.rfind('@', e);
+		if (at == std::string::npos || at < a)
+			continue;
+		size_t colon = s.find(':', a);
+		if (colon == std::string::npos || colon > at)
+			continue;
+		out.append(s, copied, colon + 1 - copied);
+		out += "[REDACTED]";
+		copied = at;
+	}
+	out.append(s, copied, std::string::npos);
+	return out;
+}
+
+std::string base_name(const std::string &t) {
+	auto s = t.rfind('/');
+	return to_lower(s == std::string::npos ? t : t.substr(s + 1));
+}
+
+bool ends_with(const std::string &s, const std::string &x) {
+	return s.size() >= x.size() && s.compare(s.size() - x.size(), x.size(), x) == 0;
+}
+
+// Command-line forms with no key=value: mysql -pSECRET, sshpass -p SECRET,
+// redis-cli -a SECRET, docker login -p SECRET, curl -u user:SECRET,
+// smbclient -U user%SECRET, sqlcmd -P SECRET, aws configure set
+// aws_secret_access_key SECRET, git config user.password SECRET.
+std::string redact_cli(const std::string &s) {
+	static const std::set<std::string> mysql = {"mysql",     "mariadb",    "mysqldump",  "mysqladmin", "mysqlimport",
+	                                            "mysqlshow", "mysqlcheck", "mysqlslap",  "mariadb-dump"};
+	static const std::set<std::string> mongo = {"mongo", "mongosh", "mongodump", "mongorestore", "mongoexport",
+	                                            "mongoimport"};
+	static const std::set<std::string> login = {"docker", "podman", "nerdctl", "helm", "buildah", "skopeo", "oras",
+	                                            "crane"};
+	static const std::set<std::string> prefix = {"sudo", "doas", "env", "exec", "nohup", "time", "nice", "command"};
+	std::vector<std::pair<size_t, size_t>> spans;  // byte ranges to replace, in order
+	std::string tool;
+	bool first = true, seen_login = false;
+	enum { NONE, FULL, USERPASS } pending = NONE;
+	for (size_t i = 0; i < s.size();) {
+		while (i < s.size() && isspace((unsigned char)s[i]))
+			i++;
+		size_t b = i;
+		while (i < s.size() && !isspace((unsigned char)s[i]))
+			i++;
+		if (b == i)
+			break;
+		std::string t = s.substr(b, i - b);
+		auto userpass = [&](size_t from) {  // user:pass or user%pass inside the token, from `from`
+			size_t c = t.find_first_of(":%", from);
+			if (c != std::string::npos && c + 1 < t.size())
+				spans.push_back({b + c + 1, i});
+		};
+		if (pending == FULL) {
+			spans.push_back({b, i});
+			pending = NONE;
+			continue;
+		}
+		if (pending == USERPASS) {
+			userpass(0);
+			pending = NONE;
+			continue;
+		}
+		if (t == "|" || t == "||" || t == "&&" || t == ";" || t == "&") {
+			first = true;
+			seen_login = false;
+			continue;
+		}
+		if (first) {
+			if (t.find('=') != std::string::npos)
+				continue;  // VAR=value before the command (redact_kv's business)
+			tool = base_name(t);
+			first = prefix.count(tool) > 0;
+			continue;
+		}
+		if (std::string bt = base_name(t); mysql.count(bt) || mongo.count(bt) || login.count(bt) || bt == "sshpass" ||
+		                                     bt == "redis-cli" || bt == "sqlcmd" || bt == "bcp" || bt == "curl" ||
+		                                     bt == "wget" || bt == "smbclient") {
+			tool = bt;  // a known tool later on the line (sudo -u x mysql ..., or prose)
+			seen_login = false;
+			continue;
+		}
+		seen_login |= t == "login";
+		std::string lt = to_lower(t);
+		if (mysql.count(tool) && t.size() > 2 && t.rfind("-p", 0) == 0 && t[2] != '-')
+			spans.push_back({b + 2, i});
+		else if ((tool == "sshpass" || tool == "redis-cli") && t.size() > 2 && t[0] == '-' &&
+		         t[1] == (tool == "sshpass" ? 'p' : 'a') && t[2] != '-')
+			spans.push_back({b + 2, i});
+		else if ((tool == "sshpass" && t == "-p") || (tool == "redis-cli" && t == "-a") ||
+		         (login.count(tool) && seen_login && t == "-p") || (mongo.count(tool) && t == "-p") ||
+		         ((tool == "sqlcmd" || tool == "bcp") && t == "-P"))
+			pending = FULL;
+		else if (t == "-u" || t == "-U" || t == "--user" || t == "--proxy-user")
+			pending = USERPASS;
+		else if (t.rfind("--user=", 0) == 0 || t.rfind("--proxy-user=", 0) == 0)
+			userpass(t.find('=') + 1);
+		else if (t.size() > 2 && (t.rfind("-u", 0) == 0 || t.rfind("-U", 0) == 0) && t[2] != '-')
+			userpass(2);
+		else if (t[0] != '-' && t.find_first_of("=:") == std::string::npos &&
+		         (ends_with(lt, "password") || ends_with(lt, "passwd") || ends_with(lt, "secret") ||
+		          ends_with(lt, "secret_key") || ends_with(lt, "access_key") || ends_with(lt, "api_key") ||
+		          ends_with(lt, "apikey") || ends_with(lt, "private_key")))
+			pending = FULL;
+	}
+	if (spans.empty())
+		return s;
+	std::string out;
+	size_t copied = 0;
+	for (auto [b, e] : spans) {
+		if (b < copied)
+			continue;
+		out.append(s, copied, b - copied);
+		out += "[REDACTED]";
+		copied = e;
+	}
+	out.append(s, copied, std::string::npos);
+	return out;
+}
+
+bool token_char(char c) { return isalnum((unsigned char)c) || c == '+' || c == '_' || c == '=' || c == '-'; }
+
+// High-entropy tokens: 32+ characters with upper case, lower case and digits
+// (hex digests and paths survive; "/" ends a token). A file name with an
+// extension right after a "/" is kept.
+std::string redact_long_tokens(const std::string &s) {
+	std::string out;
+	size_t copied = 0;
+	for (size_t i = 0; i < s.size();) {
+		if (!token_char(s[i])) {
+			i++;
+			continue;
+		}
+		size_t b = i;
+		bool up = false, lo = false, dig = false;
+		for (; i < s.size() && token_char(s[i]); i++) {
+			up |= isupper((unsigned char)s[i]) != 0;
+			lo |= islower((unsigned char)s[i]) != 0;
+			dig |= isdigit((unsigned char)s[i]) != 0;
+		}
+		if (i - b < 32 || !(up && lo && dig))
+			continue;
+		bool file = b > 0 && s[b - 1] == '/' && i + 1 < s.size() && s[i] == '.' && isalpha((unsigned char)s[i + 1]);
+		if (file)
+			continue;
+		out.append(s, copied, b - copied);
+		out += "[REDACTED]";
+		copied = i;
+	}
+	out.append(s, copied, std::string::npos);
+	return out;
+}
+
+// Base64 that decodes to readable text with spaces (echo ... | base64 -d | sh,
+// powershell -enc ...) is shown decoded so the model sees the payload; the
+// decoded text is redacted with everything else. Anything else (keys, blobs,
+// random passwords) is left for the high-entropy rule.
+std::string decode_base64_commands(const std::string &s) {
+	std::string out;
+	size_t copied = 0;
+	auto b64 = [](char c) { return isalnum((unsigned char)c) || c == '+' || c == '/' || c == '='; };
+	for (size_t i = 0; i < s.size();) {
+		if (!b64(s[i])) {
+			i++;
+			continue;
+		}
+		size_t b = i;
+		while (i < s.size() && b64(s[i]))
+			i++;
+		if (i - b < 24 || (i - b) % 4)
+			continue;
+		auto dec = base64_decode(std::string_view(s).substr(b, i - b));
+		if (!dec)
+			continue;
+		std::string text = *dec;
+		size_t zeros = 0;
+		for (size_t k = 1; k < text.size(); k += 2)
+			zeros += text[k] == 0;
+		if (text.size() >= 4 && zeros * 2 >= text.size() / 2) {  // UTF-16LE (PowerShell -EncodedCommand)
+			std::string narrow;
+			for (size_t k = 0; k < text.size(); k += 2)
+				narrow += text[k];
+			text = narrow;
+		}
+		bool readable = text.find(' ') != std::string::npos;
+		for (unsigned char c : text)
+			readable &= (c >= 0x20 && c < 0x7f) || c == '\t' || c == '\n' || c == '\r';
+		if (!readable)
+			continue;
+		out.append(s, copied, b - copied);
+		out += "[base64: " + utf8_prefix(text, 1024) + "]";
+		copied = i;
+	}
+	out.append(s, copied, std::string::npos);
+	return out;
+}
+
+}  // namespace
 
 std::string redact(const std::string &in) {
 	static const std::regex pem(R"(-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----)");
-	static const std::regex url_creds(R"(([a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]+):[^@\s/]+@)");
+	static const std::regex pem_open(R"(-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*)");  // cut off by the cap
 	static const std::regex auth_hdr(R"(((?:authorization|proxy-authorization)\s*:?\s*(?:bearer|basic|token)\s+)\S+)",
 	                                 std::regex::icase);
-	static const std::regex kv(
-	    R"(((?:pass(?:word|wd)?|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|client[_-]?secret|private[_-]?key|auth)[a-z0-9_-]*\s*[=:]\s*)("[^"]*"|'[^']*'|[^\s&;]+))",
-	    std::regex::icase);
 	static const std::regex flag(
 	    R"((--?(?:pass(?:word|wd)?|token|secret|api-?key|access-key|auth-token)[= ]+)("[^"]*"|'[^']*'|\S+))",
 	    std::regex::icase);
 	static const std::regex known(
 	    R"(\b(?:sk-ant-[A-Za-z0-9_-]{10,}|sk-[A-Za-z0-9_-]{20,}|A[KS]IA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|xox[abprs]-[A-Za-z0-9-]{10,}|glpat-[A-Za-z0-9_-]{20,}|wisp_[A-Za-z0-9_-]{20,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}))");
-	static const std::regex longtok(R"([A-Za-z0-9+_=-]{32,})");  // no "/": keep paths readable
-	std::string s = std::regex_replace(in, pem, "[REDACTED PRIVATE KEY]");
-	s = std::regex_replace(s, url_creds, "$1:[REDACTED]@");
+	// Bounded input first: the cost of everything below grows with it.
+	std::string s = utf8_clean(in);
+	if (s.size() > MAX_REDACT)
+		s = utf8_prefix(s, MAX_REDACT) + " [truncated " + std::to_string(in.size() - MAX_REDACT) + " bytes]";
+	s = std::regex_replace(s, pem, "[REDACTED PRIVATE KEY]");
+	s = std::regex_replace(s, pem_open, "[REDACTED PRIVATE KEY]");
+	s = decode_base64_commands(s);
+	s = redact_url_creds(s);
 	s = std::regex_replace(s, auth_hdr, "$1[REDACTED]");
 	s = std::regex_replace(s, flag, "$1[REDACTED]");
-	s = std::regex_replace(s, kv, "$1[REDACTED]");
+	s = redact_cli(s);
+	s = redact_kv(s);
 	s = std::regex_replace(s, known, "[REDACTED]");
-	// High-entropy tokens: mixed case and digits (hex digests and paths survive).
-	std::string out;
-	auto begin = std::sregex_iterator(s.begin(), s.end(), longtok);
-	size_t last = 0;
-	for (auto it = begin; it != std::sregex_iterator(); ++it) {
-		std::string t = it->str();
-		bool up = false, lo = false, dig = false;
-		for (char c : t) {
-			up |= c >= 'A' && c <= 'Z';
-			lo |= c >= 'a' && c <= 'z';
-			dig |= c >= '0' && c <= '9';
-		}
-		if (up && lo && dig) {
-			out.append(s, last, (size_t)it->position() - last);
-			out += "[REDACTED]";
-			last = (size_t)(it->position() + it->length());
-		}
-	}
-	out.append(s, last, std::string::npos);
-	return out;
+	return redact_long_tokens(s);
 }
 
 json redact_json(const json &j) {
@@ -242,18 +543,39 @@ json redact_json(const json &j) {
 		return out;
 	}
 	if (j.is_object()) {
+		// Keys come from sensor data too (search_events returns raw records).
 		json out = json::object();
-		for (auto &[k, v] : j.items())
-			out[k] = redact_json(v);
+		for (auto &[k, v] : j.items()) {
+			std::string key = redact(utf8_prefix(k, 256));
+			while (out.contains(key))
+				key += "'";
+			out[key] = redact_json(v);
+		}
 		return out;
 	}
 	return j;
 }
 
-std::string check_rule_line(const std::string &line) {
-	if (line.find('\n') != std::string::npos || line.size() > 1000)
-		return "must be a single line under 1000 characters";
-	// tokenise honouring double quotes, like the sensor
+std::string fence_json(const json &j, int indent) {
+	std::string d = j.dump(indent, ' ', false, json::error_handler_t::replace), out;
+	out.reserve(d.size());
+	for (char c : d) {  // these only occur inside JSON strings, where the escapes are equivalent
+		if (c == '<')
+			out += "\\u003c";
+		else if (c == '>')
+			out += "\\u003e";
+		else if (c == '&')
+			out += "\\u0026";
+		else
+			out += c;
+	}
+	return out;
+}
+
+namespace {
+
+// Tokenise a rules.conf line honouring double quotes, like the sensor.
+std::vector<std::string> rule_tokens(const std::string &line, bool *unbalanced) {
 	std::vector<std::string> tok;
 	std::string cur;
 	bool inq = false, any = false;
@@ -270,18 +592,35 @@ std::string check_rule_line(const std::string &line) {
 			cur += c;
 		}
 	}
-	if (inq)
-		return "unbalanced quote";
+	*unbalanced = inq;
 	if (any || !cur.empty())
 		tok.push_back(cur);
+	return tok;
+}
+
+int sev_rank(const std::string &s) {
+	return s == "critical" ? 4 : s == "high" ? 3 : s == "medium" ? 2 : s == "low" ? 1 : 0;
+}
+
+}  // namespace
+
+std::string check_rule_line(const std::string &line) {
+	if (line.find('\n') != std::string::npos || line.size() > 1000)
+		return "must be a single line under 1000 characters";
+	bool inq = false;
+	auto tok = rule_tokens(line, &inq);
+	if (inq)
+		return "unbalanced quote";
 	if (tok.size() < 6)
 		return "want: <id> <severity> <action> <mitre|-> \"<title>\" <cond>...";
-	static const std::regex id(R"([A-Za-z0-9][A-Za-z0-9_.-]{0,31})"), mitre(R"(-|T\d{4}(\.\d{3})?)"),
+	// The sensor's limits (agent/wisp.h): id[24], title[160], MAX_COND 8,
+	// MAX_ALT 16. Past them it truncates or drops the rule.
+	static const std::regex id(R"([A-Za-z0-9][A-Za-z0-9_.-]{0,22})"), mitre(R"(-|T\d{4}(\.\d{3})?)"),
 	    cond(R"(!?(exe|cmd|comm|pcomm|actor|src|uid|tty)(=|\^=|\$=|\*=).+)"), mode(R"(mode=(monitor|enforce))");
 	static const std::set<std::string> sev = {"info", "low", "medium", "high", "critical"},
 	                                    act = {"ignore", "alert", "kill", "quarantine"};
 	if (!std::regex_match(tok[0], id))
-		return "bad rule id";
+		return "bad rule id (at most 23 characters)";
 	if (!sev.count(tok[1]))
 		return "bad severity";
 	if (!act.count(tok[2]))
@@ -290,23 +629,83 @@ std::string check_rule_line(const std::string &line) {
 		return "bad ATT&CK technique";
 	if (tok[4].empty())
 		return "missing title";
+	if (tok[4].size() > 159)
+		return "title longer than 159 bytes";
 	int conds = 0;
 	for (size_t i = 5; i < tok.size(); i++) {
 		if (std::regex_match(tok[i], mode))
 			continue;
 		if (!std::regex_match(tok[i], cond))
 			return "bad condition: " + tok[i];
+		if (std::count(tok[i].begin(), tok[i].end(), ',') >= 16)
+			return "more than 16 values in condition: " + tok[i];
 		conds++;
 	}
+	if (conds > 8)
+		return "more than 8 conditions";
 	return conds ? "" : "a rule needs at least one condition";
 }
 
 // ---- assistant ------------------------------------------------------------------------
 
+namespace {
+
+long long num(const json &j, const char *k) {
+	auto it = j.find(k);
+	return it != j.end() && it->is_number_integer() ? it->get<long long>() : 0;
+}
+
+// Operator text placed in a prompt: redacted, and unable to open or close a tag.
+std::string prompt_text(const std::string &s) {
+	std::string r = redact(s), out;
+	for (char c : r)
+		out += c == '<' ? std::string("&lt;") : c == '>' ? std::string("&gt;") : c == '&' ? std::string("&amp;") : std::string(1, c);
+	return out;
+}
+
+}  // namespace
+
 Assistant::Assistant(Store &store, Analyst &analyst, AiConfig cfg)
     : store_(store), analyst_(analyst), cfg_(std::move(cfg)) {
 	while (!cfg_.base_url.empty() && cfg_.base_url.back() == '/')
 		cfg_.base_url.pop_back();
+	// Job history and the hourly budget from the journal (the store replays
+	// before the assistant starts).
+	auto wall = Clock::now();
+	auto mono = steady_clock::now();
+	for (auto &rec : analyst_.replayed_ai_jobs()) {
+		Job j;
+		j.id = jstr(rec, "job");
+		j.kind = jstr(rec, "purpose");
+		if (j.id.empty() || (j.kind != "triage" && j.kind != "curate" && j.kind != "ask"))
+			continue;
+		std::string target = jstr(rec, "target");
+		j.target = j.kind == "ask" ? jstr(rec, "question") : j.kind == "curate" && target.rfind("rule:", 0) == 0
+		                                                         ? target.substr(5)
+		                                                         : target;
+		j.by = jstr(rec, "by");
+		j.finished = jstr(rec, "ts");
+		j.model = jstr(rec, "model");
+		j.error = jstr(rec, "error");
+		if (rec.contains("result") && rec["result"].is_object()) {
+			j.status = "done";
+			j.result = rec["result"];
+		} else {
+			j.status = jstr(rec, "status") == "cancelled" ? "cancelled" : "failed";
+		}
+		if (rec.contains("usage") && rec["usage"].is_object()) {
+			j.input_tokens = num(rec["usage"], "input_tokens");
+			j.output_tokens = num(rec["usage"], "output_tokens");
+		}
+		auto age = wall - parse_ts(j.finished);
+		if (j.status != "cancelled" && age >= Clock::duration::zero() && age < hours(1))
+			for (long long n = std::max(1LL, num(rec, "requests")); n > 0; n--)
+				recent_.push_back(mono - duration_cast<steady_clock::duration>(age));
+		jobs_.push_back(j);
+	}
+	while (jobs_.size() > 200)
+		jobs_.pop_front();
+	std::sort(recent_.begin(), recent_.end());
 	thread_ = std::thread([this] { worker(); });
 }
 
@@ -321,6 +720,25 @@ void Assistant::stop() {
 	cv_.notify_all();
 	if (thread_.joinable())
 		thread_.join();
+	// Queued jobs that never ran still get a record: nothing vanishes silently.
+	std::vector<Job> cancelled;
+	{
+		std::lock_guard lk(mu_);
+		if (stopped_)
+			return;
+		stopped_ = true;
+		for (auto &id : queue_)
+			for (auto &x : jobs_)
+				if (x.id == id) {
+					x.status = "cancelled";
+					x.error = "the console stopped before this job ran";
+					x.finished = now_ts();
+					cancelled.push_back(x);
+				}
+		queue_.clear();
+	}
+	for (auto &j : cancelled)
+		finish(j);
 }
 
 std::string Assistant::key() {
@@ -332,19 +750,30 @@ std::string Assistant::key() {
 	return trim(cfg_.env_key);
 }
 
-bool Assistant::configured() { return !cfg_.disabled && !key().empty(); }
+std::string Assistant::unusable() {
+	if (cfg_.disabled)
+		return "disabled with -ai=false";
+	if (cfg_.max_per_hour <= 0)
+		return "disabled: -ai-max-per-hour is 0";
+	if (cfg_.base_url.rfind("https://", 0) != 0)
+		return "the API URL must be https://";
+	if (!cfg_.ca_file.empty() && !read_file(cfg_.ca_file))
+		return "cannot read the CA file " + cfg_.ca_file;
+	if (key().empty())
+		return "no API key: set -ai-key-file, the vault secret anthropic/api-key, or ANTHROPIC_API_KEY";
+	return "";
+}
+
+bool Assistant::configured() { return unusable().empty(); }
 
 json Assistant::status_json() {
-	bool ok = configured();
+	std::string why = unusable();
 	std::lock_guard lk(mu_);
 	auto now = steady_clock::now();
 	while (!recent_.empty() && now - recent_.front() > hours(1))
 		recent_.pop_front();
-	return {{"enabled", ok},
-	        {"reason", cfg_.disabled ? "disabled with -ai=false"
-	                   : ok          ? ""
-	                                 : "no API key: set -ai-key-file, the vault secret anthropic/api-key, or "
-	                                   "ANTHROPIC_API_KEY"},
+	return {{"enabled", why.empty()},
+	        {"reason", why},
 	        {"model", cfg_.model},
 	        {"effort", cfg_.effort},
 	        {"queued", queue_.size()},
@@ -362,9 +791,12 @@ json Assistant::job_json(const Job &j) {
 }
 
 json Assistant::submit(const std::string &kind, const std::string &target, const std::string &by) {
+	std::string resolved = target;
 	if (kind == "triage") {
-		if (!analyst_.incident(target))
+		auto inc = analyst_.incident(target);
+		if (!inc)
 			throw std::invalid_argument("no such incident");
+		resolved = inc->id;  // an id the incident had before resolves to the current one
 	} else if (kind == "curate") {
 		bool found = false;
 		for (auto &r : analyst_.rule_stats())
@@ -372,13 +804,13 @@ json Assistant::submit(const std::string &kind, const std::string &target, const
 		if (!found)
 			throw std::invalid_argument("no alerts for that rule");
 	} else if (kind == "ask") {
-		if (trim(target).empty() || target.size() > 2000)
-			throw std::invalid_argument("question must be 1..2000 characters");
+		if (trim(target).empty() || target.size() > 2000 || !valid_utf8(target))
+			throw std::invalid_argument("question must be 1..2000 characters of UTF-8 text");
 	} else {
 		throw std::invalid_argument("kind must be triage, curate or ask");
 	}
-	if (!configured())
-		throw std::runtime_error(status_json()["reason"].get<std::string>());
+	if (std::string why = unusable(); !why.empty())
+		throw std::runtime_error(why);
 	std::lock_guard lk(mu_);
 	auto now = steady_clock::now();
 	while (!recent_.empty() && now - recent_.front() > hours(1))
@@ -387,11 +819,11 @@ json Assistant::submit(const std::string &kind, const std::string &target, const
 		throw std::runtime_error("AI hourly limit reached (" + std::to_string(cfg_.max_per_hour) + "); try later");
 	if (queue_.size() >= cfg_.max_queue)
 		throw std::runtime_error("AI queue is full; try again shortly");
-	recent_.push_back(now);
+	recent_.push_back(now);  // the job's first request; call() counts the rest
 	Job j;
 	j.id = "J" + std::to_string(unix_now()) + "-" + std::to_string(++seq_);
 	j.kind = kind;
-	j.target = target;
+	j.target = resolved;
 	j.by = by;
 	j.created = now_ts();
 	j.model = cfg_.model;
@@ -419,6 +851,13 @@ json Assistant::jobs_json() {
 	return out;
 }
 
+static void take_usage(const json &u, long long *in, long long *out, std::string *model) {
+	*in = num(u, "input_tokens");
+	*out = num(u, "output_tokens");
+	if (u.contains("model") && u["model"].is_string())
+		*model = u["model"].get<std::string>();
+}
+
 void Assistant::worker() {
 	for (;;) {
 		Job j;
@@ -426,7 +865,7 @@ void Assistant::worker() {
 			std::unique_lock lk(mu_);
 			cv_.wait(lk, [&] { return stop_ || !queue_.empty(); });
 			if (stop_)
-				return;
+				return;  // stop() records what is still queued
 			std::string id = queue_.front();
 			queue_.pop_front();
 			for (auto &x : jobs_)
@@ -435,8 +874,8 @@ void Assistant::worker() {
 					x.started = now_ts();
 					j = x;
 				}
+			reserved_ = true;
 		}
-		json record = {{"type", "ai_result"}, {"purpose", j.kind}, {"by", j.by}, {"job", j.id}};
 		try {
 			json result = j.kind == "triage" ? run_triage(j) : j.kind == "curate" ? run_curate(j) : run_ask(j);
 			j.result = result;
@@ -445,28 +884,49 @@ void Assistant::worker() {
 			j.status = "failed";
 			j.error = e.what();
 		}
+		{
+			std::lock_guard lk(mu_);
+			reserved_ = false;
+		}
+		// Billed tokens count whether or not the job succeeded.
+		take_usage(j.usage, &j.input_tokens, &j.output_tokens, &j.model);
 		j.finished = now_ts();
+		finish(j);
+	}
+}
+
+void Assistant::finish(Job &j) {
+	// Nothing here may escape: an exception on this thread would end the process.
+	try {
+		j.error = utf8_clean(j.error);  // a proxy's reply can carry any bytes
 		std::string target = j.kind == "triage" ? j.target : j.kind == "curate" ? "rule:" + j.target : "ask:" + j.id;
-		record["target"] = target;
-		record["model"] = j.model;
-		record["usage"] = {{"input_tokens", j.input_tokens}, {"output_tokens", j.output_tokens}};
+		json record = {{"type", "ai_result"}, {"purpose", j.kind}, {"by", j.by},     {"job", j.id},
+		               {"target", target},    {"model", j.model},  {"status", j.status},
+		               {"requests", std::max(1LL, num(j.usage, "requests"))},
+		               {"usage", {{"input_tokens", j.input_tokens}, {"output_tokens", j.output_tokens}}}};
 		if (j.kind == "ask")
-			record["question"] = j.target;
+			record["question"] = redact(j.target);  // the journal never holds what redaction would remove
 		if (j.status == "done")
 			record["result"] = j.result;
 		else
 			record["error"] = j.error;
-		record["ts"] = j.finished;
-		store_.record_console(record);
+		record["ts"] = j.finished.empty() ? now_ts() : j.finished;
+		try {
+			store_.record_console(record);
+		} catch (const std::exception &e) {
+			logf("ai: could not journal %s: %s", j.id.c_str(), e.what());
+		}
 		if (j.status == "done" && j.kind != "ask")
 			analyst_.attach_ai(target, record);
 		logf("ai: %s %s by %s: %s (%lld in / %lld out tokens)%s", j.kind.c_str(), j.id.c_str(), j.by.c_str(),
 		     j.status.c_str(), j.input_tokens, j.output_tokens, j.error.empty() ? "" : (": " + j.error).c_str());
-		std::lock_guard lk(mu_);
-		for (auto &x : jobs_)
-			if (x.id == j.id)
-				x = j;
+	} catch (const std::exception &e) {
+		logf("ai: finishing %s failed: %s", j.id.c_str(), e.what());
 	}
+	std::lock_guard lk(mu_);
+	for (auto &x : jobs_)
+		if (x.id == j.id)
+			x = j;
 }
 
 json Assistant::call(json body, json *usage) {
@@ -475,7 +935,11 @@ json Assistant::call(json body, json *usage) {
 		throw std::runtime_error("no API key configured");
 	body["model"] = cfg_.model;
 	if (!body.contains("max_tokens"))
-		body["max_tokens"] = 16000;
+		body["max_tokens"] = cfg_.max_tokens > 0                                 ? cfg_.max_tokens
+		                     : cfg_.effort == "xhigh" || cfg_.effort == "max" ? 32000
+		                                                                         : 16000;
+	// Claude Opus 5.5 thinks adaptively and cannot have thinking disabled; the
+	// effort (default medium there) is the only control, so it is always sent.
 	if (!cfg_.effort.empty())
 		body["output_config"]["effort"] = cfg_.effort;
 	Headers h = {{"Content-Type", "application/json"},
@@ -487,12 +951,33 @@ json Assistant::call(json body, json *usage) {
 		body["fallbacks"] = "default";
 		h.push_back({"anthropic-beta", FALLBACK_BETA});
 	}
-	std::string payload = body.dump();
+	std::string payload = body.dump(-1, ' ', false, json::error_handler_t::replace);
 	std::string last_err;
 	for (int attempt = 0; attempt < 3; attempt++) {
+		{
+			// Every request counts against the hourly cap (the job's first one
+			// was counted when it was submitted).
+			std::lock_guard lk(mu_);
+			auto now = steady_clock::now();
+			while (!recent_.empty() && now - recent_.front() > hours(1))
+				recent_.pop_front();
+			if (reserved_) {
+				reserved_ = false;
+			} else {
+				if ((int)recent_.size() >= cfg_.max_per_hour)
+					throw std::runtime_error("AI hourly limit reached (" + std::to_string(cfg_.max_per_hour) +
+					                         " requests) during this job");
+				recent_.push_back(now);
+			}
+		}
+		if (usage)
+			(*usage)["requests"] = num(*usage, "requests") + 1;
+		auto t0 = steady_clock::now();
 		auto r = https_request("POST", cfg_.base_url + "/v1/messages", h, payload, cfg_.timeout, cfg_.ca_file, &stopping_);
-		if (stopping_)
-			throw std::runtime_error("the console is shutting down");
+		if (r.status == 200 && !r.error.empty()) {  // failed after the headers: a transport error, not a reply
+			r.status = -1;
+			r.body.clear();
+		}
 		if (r.status == 200) {
 			json resp;
 			try {
@@ -500,14 +985,26 @@ json Assistant::call(json body, json *usage) {
 			} catch (...) {
 				throw std::runtime_error("unparseable response from the Claude API");
 			}
-			if (usage && resp.contains("usage")) {
+			// Usage first: these tokens are billed whatever happens next.
+			if (usage && resp.contains("usage") && resp["usage"].is_object()) {
 				auto &u = resp["usage"];
-				(*usage)["input_tokens"] = usage->value("input_tokens", 0LL) + u.value("input_tokens", 0LL) +
-				                           u.value("cache_read_input_tokens", 0LL) +
-				                           u.value("cache_creation_input_tokens", 0LL);
-				(*usage)["output_tokens"] = usage->value("output_tokens", 0LL) + u.value("output_tokens", 0LL);
-				(*usage)["model"] = resp.value("model", cfg_.model);
+				std::vector<json> parts;
+				if (u.contains("iterations") && u["iterations"].is_array() && !u["iterations"].empty())
+					for (auto &it : u["iterations"])  // every attempt, fallbacks included
+						if (it.is_object())
+							parts.push_back(it);
+				if (parts.empty())
+					parts.push_back(u);
+				for (auto &p : parts) {
+					(*usage)["input_tokens"] = num(*usage, "input_tokens") + num(p, "input_tokens") +
+					                           num(p, "cache_read_input_tokens") + num(p, "cache_creation_input_tokens");
+					(*usage)["output_tokens"] = num(*usage, "output_tokens") + num(p, "output_tokens");
+				}
+				(*usage)["model"] = resp.contains("model") && resp["model"].is_string() ? resp["model"].get<std::string>()
+				                                                                         : cfg_.model;
 			}
+			if (stopping_)
+				throw std::runtime_error("the console is shutting down");
 			std::string stop = jstr(resp, "stop_reason");
 			if (stop == "refusal") {
 				std::string cat;
@@ -519,6 +1016,8 @@ json Assistant::call(json body, json *usage) {
 				throw std::runtime_error("the response hit max_tokens before finishing");
 			return resp;
 		}
+		if (stopping_)
+			throw std::runtime_error("the console is shutting down");
 		std::string msg = r.error;
 		try {
 			auto e = json::parse(r.body);
@@ -526,8 +1025,15 @@ json Assistant::call(json body, json *usage) {
 				msg = jstr(e["error"], "type") + ": " + jstr(e["error"], "message");
 		} catch (...) {
 		}
-		last_err = r.status < 0 ? msg : "Claude API " + std::to_string(r.status) + (msg.empty() ? "" : " " + msg);
-		bool retry = r.status < 0 || r.status == 429 || r.status == 408 || r.status == 409 || r.status >= 500;
+		last_err = utf8_clean(r.status < 0 ? msg : "Claude API " + std::to_string(r.status) + (msg.empty() ? "" : " " + msg));
+		// Configuration and certificate problems do not fix themselves, and a
+		// request that ran into the full timeout would only run into it again.
+		bool permanent = r.status < 0 && (contains(msg, "certificate") || msg.rfind("CA file", 0) == 0 ||
+		                                  msg.rfind("only https", 0) == 0 || msg.rfind("invalid", 0) == 0 ||
+		                                  msg.rfind("HTTPS_PROXY", 0) == 0 ||
+		                                  (contains(msg, "timed out") && steady_clock::now() - t0 >= cfg_.timeout / 2));
+		bool retry = !permanent &&
+		             (r.status < 0 || r.status == 429 || r.status == 408 || r.status == 409 || r.status >= 500);
 		if (!retry || attempt == 2)
 			break;
 		int wait = 2 << attempt;
@@ -542,41 +1048,56 @@ json Assistant::call(json body, json *usage) {
 	throw std::runtime_error(last_err);
 }
 
-static void take_usage(const json &u, long long *in, long long *out, std::string *model) {
-	*in = u.value("input_tokens", 0LL);
-	*out = u.value("output_tokens", 0LL);
-	if (u.contains("model") && u["model"].is_string())
-		*model = u["model"].get<std::string>();
-}
-
 json Assistant::run_triage(Job &j) {
 	auto inc = analyst_.incident(j.target);
 	if (!inc)
 		throw std::runtime_error("the incident is no longer in the console's window");
-	json data = analyst_.incident_json(*inc, true);
+	auto stop_check = [&] {
+		if (stopping_)
+			throw std::runtime_error("the console is shutting down");
+	};
+	json data = analyst_.incident_json(*inc, false);
 	data.erase("ai");
-	data.erase("suggestions");
+	// A bounded prompt: the most severe alerts, newest first among equals, at
+	// most MAX_TRIAGE_ALERTS of them (in time order), and counts for the rest.
+	std::vector<size_t> pick(inc->alerts.size());
+	for (size_t i = 0; i < pick.size(); i++)
+		pick[i] = i;
+	std::stable_sort(pick.begin(), pick.end(), [&](size_t a, size_t b) {
+		int sa = sev_rank(inc->alerts[a].severity), sb = sev_rank(inc->alerts[b].severity);
+		return sa != sb ? sa > sb : a > b;
+	});
+	size_t keep = std::min(pick.size(), MAX_TRIAGE_ALERTS);
+	std::map<std::string, int> omitted;
+	for (size_t k = keep; k < pick.size(); k++)
+		omitted[inc->alerts[pick[k]].rule]++;
+	pick.resize(keep);
+	std::sort(pick.begin(), pick.end());
 	json alerts = json::array();
-	std::set<long long> pids;
-	for (auto &a : inc->alerts) {
+	std::vector<long long> pids;
+	std::set<long long> seen;
+	for (size_t i : pick) {
+		auto &a = inc->alerts[i];
 		alerts.push_back({{"id", a.id},     {"ts", a.ts},         {"rule", a.rule},   {"title", a.title},
 		                  {"severity", a.severity}, {"mitre", a.mitre}, {"action", a.action},
 		                  {"actor", a.actor}, {"actor_src", a.actor_src}, {"pid", a.pid}, {"ppid", a.ppid},
 		                  {"uid", a.uid},   {"comm", a.comm},     {"exe", a.exe},     {"cmd", a.cmd},
 		                  {"dest", a.dest}, {"dport", a.dport},   {"path", a.path},   {"status", a.status},
 		                  {"note", a.note}});
-		if (a.pid)
-			pids.insert(a.pid);
-		if (a.ppid)
-			pids.insert(a.ppid);
+		for (long long p : {a.pid, a.ppid})
+			if (p && seen.insert(p).second)
+				pids.push_back(p);
 	}
 	data["alerts"] = alerts;
+	if (!omitted.empty()) {
+		data["alerts_omitted"] = inc->alerts.size() - keep;
+		data["omitted_by_rule"] = omitted;
+	}
 	// surrounding activity of the same processes, from the journal
 	json related = json::array();
-	for (long long pid : pids) {
-		if (related.size() >= 60)
-			break;
-		for (auto &e : store_.search_events({{"host", {inc->host}}, {"pid", {std::to_string(pid)}}, {"limit", {"20"}}}))
+	for (size_t k = 0; k < pids.size() && k < 40 && related.size() < 60; k++) {
+		stop_check();
+		for (auto &e : store_.search_events({{"host", {inc->host}}, {"pid", {std::to_string(pids[k])}}, {"limit", {"20"}}}))
 			if (related.size() < 60 && jstr(e, "type") != "alert")
 				related.push_back(e);
 	}
@@ -588,6 +1109,24 @@ json Assistant::run_triage(Job &j) {
 			host["inventory"] = json(std::vector<json>(host["inventory"].begin(), host["inventory"].begin() + 40));
 		data["host_record"] = host;  // "host" stays the incident's host name
 	}
+	stop_check();
+	json red = redact_json(data);
+	std::string fenced = fence_json(red, 1);
+	// Over the byte budget: drop the context first, then alerts.
+	for (const char *drop : {"related_events", "host_record"})
+		if (fenced.size() > MAX_TRIAGE_PROMPT) {
+			red.erase(drop);
+			fenced = fence_json(red, 1);
+		}
+	while (fenced.size() > MAX_TRIAGE_PROMPT && red["alerts"].size() > 5) {
+		json fewer = json::array();
+		for (size_t i = red["alerts"].size() / 2; i < red["alerts"].size(); i++)
+			fewer.push_back(red["alerts"][i]);
+		red["alerts"] = fewer;
+		red["alerts_omitted"] = inc->alerts.size() - fewer.size();
+		fenced = fence_json(red, 1);
+	}
+	stop_check();
 	std::string prompt =
 	    "Triage this incident. Decide whether it is malicious, suspicious (a human should look), or benign "
 	    "(expected activity), and how confident you are. Keep the reasoning short and cite specific alerts and "
@@ -599,22 +1138,25 @@ json Assistant::run_triage(Job &j) {
 	    "rules.conf change (give exact steps)\n"
 	    "Recommend nothing when nothing is warranted. Use empty strings and 0 for fields an action type does not "
 	    "use.\n\n<fleet_data>\n" +
-	    redact_json(data).dump(1) + "\n</fleet_data>";
-	json usage = json::object();
+	    fenced + "\n</fleet_data>";
 	json resp = call({{"system", {{{"type", "text"}, {"text", SYSTEM_PROMPT}, {"cache_control", {{"type", "ephemeral"}}}}}},
 	                  {"messages", {{{"role", "user"}, {"content", prompt}}}},
 	                  {"output_config", {{"format", {{"type", "json_schema"}, {"schema", triage_schema()}}}}}},
-	                 &usage);
-	take_usage(usage, &j.input_tokens, &j.output_tokens, &j.model);
+	                 &j.usage);
 	json out = parse_structured(resp);
+	if (!out.is_object())
+		throw std::runtime_error("the model returned no structured result");
+	std::string verdict = jstr(out, "verdict");
 
 	// Recommendations become suggestions only through the validated path, and
 	// only within the incident's scope.
 	std::set<std::string> scope_hosts(inc->campaign_hosts.begin(), inc->campaign_hosts.end());
 	scope_hosts.insert(inc->host);
 	json proposed = json::array(), dropped = json::array();
-	for (auto &r : out.value("recommended_actions", json::array())) {
-		std::string type = jstr(r, "type"), title = jstr(r, "title");
+	json recs = out.contains("recommended_actions") && out["recommended_actions"].is_array() ? out["recommended_actions"]
+	                                                                                         : json::array();
+	for (auto &r : recs) {
+		std::string type = jstr(r, "type"), title = utf8_prefix(jstr(r, "title"), 300);
 		json action;
 		try {
 			if (type == "push") {
@@ -622,34 +1164,38 @@ json Assistant::run_triage(Job &j) {
 					throw std::invalid_argument("host is outside this incident");
 				action = {{"type", "push"}, {"host", jstr(r, "host")}, {"control", jstr(r, "control")}};
 			} else if (type == "rollout") {
+				// Exactly the incident host's own, named group: an empty group
+				// would be a rollout to every group in the fleet.
+				if (inc->group.empty())
+					throw std::invalid_argument("the incident host has no group; a rollout would reach every group");
 				if (jstr(r, "group") != inc->group)
 					throw std::invalid_argument("group is not the incident host's group");
-				action = {{"type", "rollout"},
-				          {"group", inc->group},
-				          {"control", jstr(r, "control")},
-				          {"percent", r.value("percent", 0)}};
+				int pct = r.contains("percent") && r["percent"].is_number_integer() ? r["percent"].get<int>() : 0;
+				action = {{"type", "rollout"}, {"group", inc->group}, {"control", jstr(r, "control")}, {"percent", pct}};
 			} else if (type == "triage") {
 				json ids = json::array();
 				for (auto &a : inc->alerts)
 					ids.push_back(a.id);
+				// A fixed note: the model's words never become a triage verdict
+				// (and so never count toward a rule's benign tally).
 				action = {{"type", "triage"},
 				          {"alerts", ids},
 				          {"status", jstr(r, "triage_status")},
-				          {"note", "AI triage: " + title}};
+				          {"note", "Set by an approved AI triage suggestion for " + inc->id}};
 			} else {
-				action = {{"type", "manual"}, {"instructions", jstr(r, "instructions")}};
+				action = {{"type", "manual"}, {"instructions", utf8_prefix(jstr(r, "instructions"), 4000)}};
 			}
 			if (jstr(action, "control") == "monitor")
 				throw std::invalid_argument("the assistant may not weaken protection");
 			Suggestion s;
 			s.kind = "ai_" + type;
 			s.source = "ai";
-			s.severity = severity_for(jstr(out, "verdict"));
-			s.title = title.empty() ? "AI recommendation for " + inc->id : title.substr(0, 300);
-			s.rationale = jstr(r, "rationale").substr(0, 6000);
+			s.severity = severity_for(verdict);
+			s.title = title.empty() ? "AI recommendation for " + inc->id : title;
+			s.rationale = utf8_prefix(jstr(r, "rationale"), 6000);
 			s.action = action;
 			s.evidence = {inc->id};
-			s.key = "ai:" + inc->id + ":" + action.dump();
+			s.key = "ai:" + inc->id + ":" + action.dump(-1, ' ', false, json::error_handler_t::replace);
 			proposed.push_back(analyst_.propose(s).id);
 		} catch (const std::exception &e) {
 			dropped.push_back({{"title", title}, {"reason", e.what()}});
@@ -697,31 +1243,63 @@ json Assistant::run_curate(Job &j) {
 	    "it (too noisy or too broad), make it blocking (it only catches real attacks), or retire it. Propose "
 	    "complete replacement or additional rules.conf lines; an allow-list entry is a rule with action ignore "
 	    "placed before it. Keep the rule's id when you replace it. Propose nothing if it is fine as it is.\n\n" +
-	    std::string(RULE_GRAMMAR) + "\n\n<fleet_data>\n" + redact_json(data).dump(1) + "\n</fleet_data>";
-	json usage = json::object();
+	    std::string(RULE_GRAMMAR) + "\n\n<fleet_data>\n" + fence_json(redact_json(data), 1) + "\n</fleet_data>";
 	json resp = call({{"system", {{{"type", "text"}, {"text", SYSTEM_PROMPT}, {"cache_control", {{"type", "ephemeral"}}}}}},
 	                  {"messages", {{{"role", "user"}, {"content", prompt}}}},
 	                  {"output_config", {{"format", {{"type", "json_schema"}, {"schema", curate_schema()}}}}}},
-	                 &usage);
-	take_usage(usage, &j.input_tokens, &j.output_tokens, &j.model);
+	                 &j.usage);
 	json out = parse_structured(resp);
+	if (!out.is_object())
+		throw std::runtime_error("the model returned no structured result");
+	static const std::set<std::string> changes = {"narrow", "severity", "action", "replace", "new_rule"};
+	bool was_blocking = stat->action == "kill" || stat->action == "quarantine" || stat->action == "would-block" ||
+	                    stat->action == "kill-failed";
 	json proposed = json::array(), dropped = json::array();
-	for (auto &p : out.value("proposals", json::array())) {
+	json props = out.contains("proposals") && out["proposals"].is_array() ? out["proposals"] : json::array();
+	for (auto &p : props) {
 		std::string line = trim(jstr(p, "rule_line"));
 		std::string bad = check_rule_line(line);
+		if (bad.empty() && !valid_utf8(line))
+			bad = "not valid UTF-8";
 		if (!bad.empty()) {
-			dropped.push_back({{"rule_line", line}, {"reason", bad}});
+			dropped.push_back({{"rule_line", utf8_clean(utf8_prefix(line, 1000))}, {"reason", bad}});
 			continue;
 		}
+		std::string change = changes.count(jstr(p, "change")) ? jstr(p, "change") : "change";
+		// Curation reads telemetry an attacker can shape, so anything that
+		// would detect or stop less is marked as such, not slipped in.
+		bool unbalanced = false;
+		auto tok = rule_tokens(line, &unbalanced);
+		std::vector<std::string> weakens;
+		if (tok[2] == "ignore")
+			weakens.push_back("adds an allow-list (ignore) entry");
+		if (tok[0] == stat->rule && sev_rank(tok[1]) < sev_rank(stat->severity))
+			weakens.push_back("lowers the severity from " + stat->severity + " to " + tok[1]);
+		if (tok[0] == stat->rule && was_blocking && tok[2] == "alert")
+			weakens.push_back("stops blocking");
+		bool excludes = false;
+		for (size_t i = 5; i < tok.size(); i++)
+			excludes |= !tok[i].empty() && tok[i][0] == '!';
+		if (tok[0] == stat->rule && (excludes || change == "narrow"))
+			weakens.push_back("narrows what the rule matches");
+		std::string why = weakens.empty() ? "" : weakens[0];
+		for (size_t i = 1; i < weakens.size(); i++)
+			why += "; " + weakens[i];
 		Suggestion s;
 		s.kind = "ai_rule";
 		s.source = "ai";
-		s.severity = "low";
-		s.title = "Rule " + j.target + ": " + jstr(p, "change") + " (AI)";
-		s.rationale = jstr(p, "rationale").substr(0, 6000);
+		s.severity = weakens.empty() ? "low" : "medium";
+		s.title = "Rule " + j.target + ": " + change + (weakens.empty() ? " (AI)" : " (AI, weakens detection)");
+		s.rationale = utf8_prefix(jstr(p, "rationale"), 6000);
 		s.action = {{"type", "manual"},
-		            {"instructions", "In rules.conf (" + jstr(p, "change") + " for " + j.target + "):\n" + line +
+		            {"instructions", (weakens.empty() ? std::string()
+		                                              : "WEAKENS DETECTION (" + why +
+		                                                    "). The model proposed this from telemetry an attacker can "
+		                                                    "influence; check it against the alerts before applying.\n") +
+		                                 "In rules.conf (" + change + " for " + j.target + "):\n" + line +
 		                                 "\nThen check it with `wispd --check-config` and push a policy reload."}};
+		if (!weakens.empty())
+			s.action["weakens"] = why;
 		s.evidence = {"rule:" + j.target};
 		s.key = "ai-rule:" + line;
 		try {
@@ -804,17 +1382,16 @@ json Assistant::run_ask(Job &j) {
 	     {"content", "Answer this question from a security operator about their fleet. Use the tools to look at "
 	                 "the data; cite hosts, incident IDs and rules. If the data does not answer it, say so. Be "
 	                 "concise: short paragraphs or bullet lists.\n\n<question>\n" +
-	                     j.target + "\n</question>"}});
+	                     prompt_text(j.target) + "\n</question>"}});
 	json calls = json::array();
-	json usage = json::object();
+	size_t tool_bytes = 0;
 	for (int turn = 0; turn < cfg_.max_tool_turns; turn++) {
 		json resp = call({{"system", {{{"type", "text"}, {"text", SYSTEM_PROMPT}}}},
 		                  {"tools", tools()},
 		                  {"cache_control", {{"type", "ephemeral"}}},
 		                  {"messages", messages}},
-		                 &usage);
-		take_usage(usage, &j.input_tokens, &j.output_tokens, &j.model);
-		json content = resp.value("content", json::array());
+		                 &j.usage);
+		json content = resp.contains("content") && resp["content"].is_array() ? resp["content"] : json::array();
 		messages.push_back({{"role", "assistant"}, {"content", content}});  // unchanged, thinking blocks included
 		if (jstr(resp, "stop_reason") != "tool_use") {
 			std::string answer;
@@ -832,16 +1409,25 @@ json Assistant::run_ask(Job &j) {
 			calls.push_back({{"name", name}, {"input", input}});
 			json r;
 			bool err = false;
-			try {
-				r = tool(name, input.is_object() ? input : json::object());
-				err = r.is_object() && r.contains("error");
-			} catch (const std::exception &e) {
-				r = {{"error", e.what()}};
+			if (tool_bytes >= MAX_ASK_TOOL_BYTES) {
+				r = {{"error", "the data budget for this question is used up; answer from what you have"}};
 				err = true;
+			} else {
+				try {
+					if (stopping_)
+						throw std::runtime_error("the console is shutting down");
+					r = tool(name, input.is_object() ? input : json::object());
+					err = r.is_object() && r.contains("error");
+				} catch (const std::exception &e) {
+					r = {{"error", e.what()}};
+					err = true;
+				}
 			}
+			std::string text = truncate_json(redact_json(r));
+			tool_bytes += text.size();
 			json block = {{"type", "tool_result"},
 			              {"tool_use_id", jstr(b, "id")},
-			              {"content", "<fleet_data>\n" + truncate_json(redact_json(r)) + "\n</fleet_data>"}};
+			              {"content", "<fleet_data>\n" + text + "\n</fleet_data>"}};
 			if (err)
 				block["is_error"] = true;
 			results.push_back(block);

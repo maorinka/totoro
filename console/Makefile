@@ -10,6 +10,8 @@ VERSION  := $(shell cat ../VERSION 2>/dev/null || echo dev)
 WARN     := -Wall -Wextra -Wshadow -Wnon-virtual-dtor -Wcast-align -Wformat=2
 CXXFLAGS ?= -O2 -g
 CXXFLAGS += -std=c++20 $(WARN) -pthread -DWISP_VERSION='"$(VERSION)"' -Isrc -Ibuild
+# Reproducible builds: no absolute source paths in debug info or __FILE__.
+CXXFLAGS += -ffile-prefix-map=$(CURDIR)=.
 # Production hardening for a network-facing service.
 HARDEN   := -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIE
 LDHARDEN := -pie -Wl,-z,relro,-z,now

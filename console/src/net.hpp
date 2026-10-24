@@ -61,6 +61,10 @@ public:
 	void close_gracefully(Deadline dl);
 	bool tls() const { return ssl_ != nullptr; }
 	int fd() const { return fd_; }
+	// After a successful handshake: the client certificate's SHA-256 (hex) and
+	// subject ("CN=...", then its DNS/IP SANs, comma-separated). False when
+	// the peer presented none (or the stream is plaintext).
+	bool peer_cert(std::string *fingerprint, std::string *subject);
 
 private:
 	int wait(short events, Deadline dl);  // 1 ready, 0 deadline passed, -1 error/shutdown

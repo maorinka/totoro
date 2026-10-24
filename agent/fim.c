@@ -45,6 +45,7 @@ struct fwatch {
 static struct fwatch tab_a[MAX_FIM], tab_b[MAX_FIM];
 static struct fwatch *fw = tab_a;
 static int nfw;
+static int nabsent;     /* paths of the current set that did not exist when loaded */
 static int ifd = -1;
 static char conf[MAX_PATH];
 
@@ -169,6 +170,8 @@ static void arm_new(struct fwatch *e, const char *file)
 	if (arm_self(e) >= 0)
 		return;
 	int se = errno;
+	if (se == ENOENT || se == ENOTDIR)
+		nabsent++;
 	if (se != ENOENT && se != ENOTDIR)
 		cfg_problem(file, e->line, "cannot watch %s: %s", e->path, strerror(se));
 	else if (pw >= 0)
@@ -198,6 +201,7 @@ int fim_init(int inotify_fd, const char *path)
 	/* Switch first, so arm_self() never removes a watch the new set shares. */
 	fw = nt;
 	nfw = n;
+	nabsent = 0;
 	for (int i = 0; i < n; i++)
 		arm_new(&nt[i], path);
 	for (int i = 0; i < on; i++) {
@@ -217,6 +221,7 @@ int fim_reload(void)
 }
 
 int fim_count(void) { return nfw; }
+int fim_absent(void) { return nabsent; }
 
 /* After an inotify queue overflow the kernel's IN_IGNORED notices may have
  * been lost with everything else: re-add every watch (a live one is kept). */

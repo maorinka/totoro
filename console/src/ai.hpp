@@ -8,15 +8,24 @@
 // Safety model:
 //   - Off unless an API key is configured (-ai-key-file, the vault secret
 //     "anthropic/api-key", or ANTHROPIC_API_KEY).
-//   - Telemetry is redacted (credentials, tokens, keys, high-entropy strings)
-//     before it leaves the console, and is presented to the model as untrusted
-//     data: command lines are attacker-controlled.
+//   - Telemetry is redacted (credentials, tokens, keys, high-entropy strings;
+//     JSON keys as well as values; every string capped at 4 KB) before it
+//     leaves the console, and is presented to the model as untrusted data
+//     inside <fleet_data>, with '<', '>' and '&' escaped so the data cannot
+//     close that block: command lines are attacker-controlled. Operator
+//     questions are redacted too.
 //   - The model only proposes. Its recommendations go through the analysis
 //     engine's validation (allow-listed action types, real targets, scoped to
 //     the incident) and wait in the suggestion inbox for a human to approve.
-//     It cannot recommend weakening protection (monitor mode).
-//   - Every call is journaled (who, what, model, token usage, outcome).
-//   - Jobs run on one background thread with a bounded queue and an hourly cap.
+//     It cannot recommend monitor mode, a rollout beyond the incident host's
+//     own (named) group, or anything outside the incident. Rule-curation
+//     proposals that would weaken detection (allow-list entries, lower
+//     severity, no longer blocking, exclusions) are marked as such. Notes the
+//     model wrote never count as a person's "benign" verdict.
+//   - Every job is journaled (who, what, model, token usage, outcome), also
+//     jobs cancelled by a shutdown; job history survives a restart.
+//   - Jobs run on one background thread with a bounded queue and an hourly cap
+//     that counts API requests (every attempt and tool round), not jobs.
 #pragma once
 
 #include <atomic>
@@ -45,16 +54,24 @@ struct AiConfig {
 	std::string effort = "high";
 	std::string ca_file;  // extra trust anchor (TLS-inspecting proxy, private gateway, tests)
 	bool fallback = true;  // server-side refusal fallback ("fallbacks": "default")
-	int max_per_hour = 60;
+	int max_per_hour = 60;  // API requests per hour; 0 turns the assistant off
 	size_t max_queue = 8;
 	int max_tool_turns = 10;
 	std::chrono::seconds timeout{600};
+	long max_tokens = 0;  // 0: 16000, or 32000 at effort xhigh/max
 	bool disabled = false;
 };
 
-// Replace credentials and other secrets in free text with [REDACTED].
+// Replace credentials and other secrets in free text with [REDACTED]. Input
+// is cut to 4 KB (on a character boundary) first, so the cost is bounded.
+// Base64 that decodes to readable text with spaces (an encoded command) is
+// shown decoded, and redacted like any other text.
 std::string redact(const std::string &s);
-json redact_json(const json &j);
+json redact_json(const json &j);  // keys too
+
+// JSON for the model's untrusted-data block: '<', '>' and '&' escaped as
+// JSON unicode escapes (u003c, u003e, u0026), so nothing in it can close <fleet_data>.
+std::string fence_json(const json &j, int indent = -1);
 
 // Syntax check for a rules.conf line (the sensor's grammar); empty when valid.
 std::string check_rule_line(const std::string &line);
@@ -66,7 +83,7 @@ public:
 	Assistant(const Assistant &) = delete;
 	Assistant &operator=(const Assistant &) = delete;
 
-	bool configured();  // a key is available
+	bool configured();  // a key is available and the configuration can work
 	json status_json();
 
 	// Queue a job. kind: triage (target = incident id), curate (target = rule
@@ -82,11 +99,15 @@ public:
 
 private:
 	struct Job {
+		// status: queued | running | done | failed | cancelled
 		std::string id, kind, target, by, status = "queued", created, started, finished, error, model;
 		json result;
+		json usage = json::object();  // accumulated by call(), billed attempts included
 		long long input_tokens = 0, output_tokens = 0;
 	};
 	void worker();
+	void finish(Job &j);  // journal, attach, log, publish; never throws
+	std::string unusable();  // why the configuration cannot work, "" when it can
 	json run_triage(Job &j);
 	json run_curate(Job &j);
 	json run_ask(Job &j);
@@ -103,7 +124,8 @@ private:
 	std::deque<std::string> queue_;
 	std::deque<std::chrono::steady_clock::time_point> recent_;
 	unsigned long long seq_ = 0;
-	bool stop_ = false;
+	bool reserved_ = false;  // the running job's first request was counted at submit
+	bool stop_ = false, stopped_ = false;
 	std::atomic<bool> stopping_{false};  // read by the HTTPS client between polls
 	std::thread thread_;
 };

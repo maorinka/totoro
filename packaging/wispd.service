@@ -1,6 +1,6 @@
 [Unit]
 Description=Wisp userspace EDR sensor
-Documentation=man:wispd(8) file:/usr/local/share/doc/wisp/README.md
+Documentation=file:/usr/local/share/doc/wisp/README.md
 After=network-online.target
 Wants=network-online.target
 
@@ -12,8 +12,8 @@ Restart=on-failure
 RestartSec=3
 
 # The sensor runs as UID 0 confined to the capability bounding set below
-# (it is not a fully unprivileged process: FIM watches and quarantine need to
-# read and move files other users own). It loads a verified eBPF tracepoint
+# (it is not an unprivileged process: FIM watches and quarantine need to
+# read and remove files other users own). It loads a verified eBPF tracepoint
 # program (not a kernel module) and reads ancestor /proc entries.
 #   CAP_BPF, CAP_PERFMON - load + attach the exec tracepoint program
 #   CAP_SYS_PTRACE       - read /proc/<pid>/{comm,exe,root} for attribution and
@@ -36,23 +36,36 @@ TasksMax=16
 # alone is 4 MiB); without this the program fails to load with EPERM there.
 LimitMEMLOCK=infinity
 
-# Hardening. The OS (/usr, /boot, /etc) stays read-only, so not even a
-# compromised sensor can change system binaries or its own configuration.
+# Hardening. ProtectSystem=strict makes the sensor's OWN view of the file
+# system read-only, except the log and state directories below. This stops
+# accidental writes by the sensor (a bug or a bad rule cannot overwrite
+# /usr or /etc through ordinary paths). It is NOT a boundary against a
+# compromised sensor: as root with CAP_SYS_PTRACE and CAP_DAC_OVERRIDE it can
+# reach any file through another process's /proc/<pid>/root, which resolves
+# in that process's (writable) mount namespace.
 ProtectSystem=strict
 # systemd creates these on every start (an image cleanup that removed them
-# must not stop the sensor) and makes them writable.
+# must not stop the sensor) and makes them writable. The quarantine
+# directory is state_dir/quarantine, i.e. /var/lib/wisp/quarantine.
 LogsDirectory=wisp
 LogsDirectoryMode=0750
 StateDirectory=wisp
 StateDirectoryMode=0750
-# Quarantine removes the offending binary from where it was run. A running
-# process's file is reached through /proc/<pid>/root (its own mount
-# namespace); one that already exited is reached through the sensor's view,
-# so the usual drop locations are writable for it and the host's real /tmp is
-# used ('-': a path that does not exist is skipped). If you point log_dir or
-# state_dir elsewhere, add that path here with a drop-in.
-ReadWritePaths=-/tmp -/var/tmp -/dev/shm -/run/user -/home -/root -/opt -/srv
-ProtectHome=no
+# Quarantine and the sandbox: a binary that is still running when the rule
+# fires (the sensor freezes it first) is copied and removed through
+# /proc/<pid>/root, i.e. in the process's own mount namespace, so it works
+# wherever the binary lives (/home, /tmp, a container, a PrivateTmp) without
+# granting the sensor write access to those paths here. Only a process that
+# already exited is looked up through the sensor's own view, which is
+# read-only: that file is left in place and the alert carries
+# "quarantine_error" (the process was still killed). This is deliberate: no
+# ReadWritePaths for user or temp directories.
+# FIM and inventory read home directories (/root/.ssh, IDE extensions), so
+# home stays visible, read-only. PrivateTmp=no keeps the host's /tmp visible
+# so a quarantine failure there reports the real reason.
+# If you point log_dir or state_dir elsewhere, add that path in a drop-in:
+#   ReadWritePaths=/srv/wisp-state
+ProtectHome=read-only
 PrivateTmp=no
 ProtectKernelTunables=yes
 ProtectControlGroups=yes

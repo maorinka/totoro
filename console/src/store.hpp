@@ -42,6 +42,9 @@ public:
 struct SensorSession {
 	std::string host;  // bound by the first hello; a connection speaks for one host
 	std::shared_ptr<SensorLink> link;
+	// The client certificate the connection authenticated with (SHA-256 hex
+	// and subject); empty for plaintext (-dev) ingest.
+	std::string cert_fp{}, cert_name{};
 	// Per-connection admission control, kept by Store::sensor_line: token
 	// buckets for lines and bytes (negative: not started yet) and the count of
 	// refused lines since the last log line about them.
@@ -50,44 +53,69 @@ struct SensorSession {
 	unsigned long long dropped = 0;
 };
 
-// An arrival-ordered window shared by many hosts. When it is full, the host
-// holding the most entries gives up its oldest one (ties: the host whose
-// oldest entry is oldest), so one noisy or hostile host can only push out its
-// own history, never every other host's.
+// An arrival-ordered window shared by many hosts, bounded by entries and by
+// estimated bytes. When it is over either bound, the host holding the most
+// (entries, or bytes) gives up its oldest one (ties: the host whose oldest
+// entry is oldest), so one noisy or hostile host can only push out its own
+// history, never every other host's, however large its entries are.
 template <class T> class FairRing {
 public:
 	std::list<T> items;  // oldest first
 
-	// Appends v for host, evicting down to `max`; `evicted` sees each entry removed.
-	template <class F> void push(const std::string &host, T v, size_t max, F &&evicted) {
+	// Appends v (costing `cost` bytes) for host, evicting down to `max`
+	// entries and `max_bytes` (0: no byte bound); `evicted` sees each entry removed.
+	template <class F>
+	void push(const std::string &host, T v, size_t cost, size_t max, size_t max_bytes, F &&evicted) {
 		auto &q = by_host_[host];
-		if (!q.empty())
-			heavy_.erase({-(long long)q.size(), q.front().first, host});
+		unindex(host, q);
 		items.push_back(std::move(v));
-		q.push_back({++seq_, std::prev(items.end())});
-		heavy_.insert({-(long long)q.size(), q.front().first, host});
-		while (items.size() > max && !heavy_.empty()) {
-			auto top = *heavy_.begin();
-			heavy_.erase(heavy_.begin());
-			const std::string &h = std::get<2>(top);
+		q.items.push_back({++seq_, std::prev(items.end()), cost});
+		q.bytes += cost;
+		bytes_ += cost;
+		index(host, q);
+		for (;;) {
+			bool over_count = items.size() > max, over_bytes = max_bytes && bytes_ > max_bytes;
+			if ((!over_count && !over_bytes) || heavy_count_.empty())
+				break;
+			std::string h = over_count ? std::get<2>(*heavy_count_.begin()) : std::get<2>(*heavy_bytes_.begin());
 			auto qi = by_host_.find(h);
-			auto it = qi->second.front().second;
-			qi->second.pop_front();
+			unindex(h, qi->second);
+			auto [_, it, c] = qi->second.items.front();
+			qi->second.items.pop_front();
+			qi->second.bytes -= c;
+			bytes_ -= c;
 			evicted(*it);
 			items.erase(it);
-			if (qi->second.empty())
+			if (qi->second.items.empty())
 				by_host_.erase(qi);
 			else
-				heavy_.insert({-(long long)qi->second.size(), qi->second.front().first, h});
+				index(h, qi->second);
 		}
 	}
 	size_t size() const { return items.size(); }
+	size_t bytes() const { return bytes_; }
 
 private:
 	using Pos = typename std::list<T>::iterator;
-	std::map<std::string, std::deque<std::pair<unsigned long long, Pos>>> by_host_;
-	std::set<std::tuple<long long, unsigned long long, std::string>> heavy_;  // (-count, oldest seq, host)
+	struct PerHost {
+		std::deque<std::tuple<unsigned long long, Pos, size_t>> items;  // (seq, position, cost)
+		size_t bytes = 0;
+	};
+	void unindex(const std::string &h, const PerHost &q) {
+		if (q.items.empty())
+			return;
+		heavy_count_.erase({-(long long)q.items.size(), std::get<0>(q.items.front()), h});
+		heavy_bytes_.erase({-(long long)q.bytes, std::get<0>(q.items.front()), h});
+	}
+	void index(const std::string &h, const PerHost &q) {
+		heavy_count_.insert({-(long long)q.items.size(), std::get<0>(q.items.front()), h});
+		heavy_bytes_.insert({-(long long)q.bytes, std::get<0>(q.items.front()), h});
+	}
+	std::map<std::string, PerHost> by_host_;
+	// (-entries or -bytes, oldest seq, host): the heaviest host first
+	std::set<std::tuple<long long, unsigned long long, std::string>> heavy_count_, heavy_bytes_;
 	unsigned long long seq_ = 0;
+	size_t bytes_ = 0;
 };
 
 struct Finding {
@@ -117,9 +145,13 @@ struct JournalHealth {
 //   console records "src":"console": triage, rollout_intent, rollout, lifecycle
 //                   (decommissioned / disconnected / seen), console alerts, and
 //                   record_console() records (suggestion, suggestion_decision, ai_result)
-//   segment header  {"type":"journal","src":"console","format":2,...} at the top
+//                   and "audit" records (operator push / vault write / listing)
+//   segment header  {"type":"journal","src":"console","format":3,...} at the top
 //                   of each segment this version opens; only records after it are
-//                   trusted to carry console-set fields (rx_ts, src, id_kept)
+//                   trusted to carry console-set fields (rx_ts, src, id_kept; from
+//                   format 3 also cert_fp, cert_name, cert_refused, part, parts)
+//   no line this version writes for a rollout exceeds 1 MiB: larger ones are
+//                   split into parts (same id, "part"/"parts") and joined on replay
 // Older consoles ignore the new types and fields; this console replays journals
 // written by older ones (their sensor timestamps are clamped to the segment's
 // mtime, and console-only record types found there are dropped).
@@ -146,7 +178,17 @@ public:
 	// estimated memory, so a flood of telemetry never evicts alerts.
 	size_t journal_keep = 50000;
 	size_t journal_keep_bytes = 128u << 20;
+	// Longest journal line written for a rollout record (larger ones are split
+	// in parts): under the 1 MiB older consoles (Go 1.0 included) replay.
+	size_t max_record = (1u << 20) - 4096;
 	size_t max_ring = 5000;         // alerts and inventory history kept in memory (fair across hosts)
+	size_t max_ring_bytes = 64u << 20;  // ...and their estimated memory, each
+	// Hosts that are not retired (decommissioned): at most max_hosts in all,
+	// and at most max_hosts_per_cert presenting one client certificate (0: no
+	// per-certificate bound, for fleets that share one sensor certificate). A
+	// hello for a new host past either bound is refused (logged).
+	size_t max_hosts = 100000;
+	size_t max_hosts_per_cert = 0;
 	size_t max_rollouts = 1000;     // rollout history kept in memory
 	size_t max_inventory_per_host = 5000;
 	size_t max_inventory_bytes_per_host = 4u << 20;  // estimated memory of one host's package state
@@ -248,6 +290,7 @@ private:
 	struct LiveLink {
 		std::shared_ptr<SensorLink> link;
 		std::string host_id, trust;  // the identity its hello presented
+		std::string cert_fp;         // the client certificate it authenticated with
 		unsigned long long seq;      // bind order: newest wins among equals
 	};
 	struct InvEntry {
@@ -267,7 +310,10 @@ private:
 	void ingest_locked(Event &e, std::string raw, std::vector<Event> &notify_now);
 	void apply(const Event &e, TimePoint at, bool replay);
 	void identity_check(Event &e);
-	void record(const std::string &raw, bool sync = false);
+	bool record(const std::string &raw, bool sync = false);  // false: refused, the journal is closed
+	bool record_parts(Event ev, bool sync);
+	bool cert_ok(const LiveLink &l, const Host &h) const;
+	bool admit_host(const Event &e, const SensorSession &s);
 	void index_event(const std::string &raw);
 	void rotate();
 	int open_segment(std::string *err, long long *size);
@@ -308,6 +354,20 @@ private:
 	std::atomic<bool> stopping_{false};
 	std::vector<Rollout> rollouts_;
 	std::map<std::string, Rollout> intents_;  // replay only: rollout_intent without its record yet
+	struct PartialRollout {
+		Rollout r;
+		std::set<long long> seen;
+		long long parts = 0;
+	};
+	std::map<std::string, PartialRollout> partial_;  // replay only: split records still being joined
+	std::chrono::steady_clock::time_point closed_logged_{}, cap_logged_{};
+	unsigned long long closed_dropped_ = 0, cap_refused_ = 0;
+	// Hosts not retired, in all and per client certificate: recounted by
+	// reap() and at replay, counted up as admit_host() lets new ones in (so
+	// between recounts they can only overstate, never understate).
+	size_t live_hosts_ = 0;
+	std::map<std::string, size_t> cert_hosts_;
+	void recount();
 	std::vector<Event> pending_notify_;  // collected under the lock, sent after
 	std::chrono::steady_clock::time_point started_ = std::chrono::steady_clock::now();
 	std::atomic<unsigned long long> generation_{0};

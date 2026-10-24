@@ -2,7 +2,8 @@ name: ci
 
 on:
   push:
-    branches: [main, production, cpp-console]
+    # The long-lived branches; every other branch gets CI through its PR.
+    branches: [master, production, production-readiness, cpp-console, analysis-ai]
   pull_request:
 
 permissions:
@@ -27,15 +28,142 @@ jobs:
       - name: Unit tests (ASan/UBSan, TSan), policy and UI checks
         run: make test
       - name: Shell scripts
-        run: shellcheck -S warning packaging/install.sh bench/mkpki.sh demo.sh
+        run: shellcheck -S warning $(git ls-files '*.sh')
       - name: Connector fallback sensor builds
         run: make -C agent clean && SENSOR=connector make -C agent && make -C agent clean && make -C agent
-      - name: Release tarball
-        run: make dist
+
+  sdk-mcp:
+    name: SDKs + MCP server
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ libssl-dev nlohmann-json3-dev
+      - name: TypeScript SDK (strict)
+        run: |
+          npx --yes -p typescript@5 tsc --noEmit --strict --target es2022 --module nodenext \
+            --moduleResolution nodenext --lib es2022,dom sdk/wisp.ts
+      - name: Python SDK and MCP server compile
+        run: python3 -m py_compile sdk/wisp.py mcp/wisp_mcp.py
+      - name: Build console
+        run: make -C console
+      - name: MCP session against a local console (viewer token; refuses an admin token)
+        run: |
+          set -euo pipefail
+          W=$(mktemp -d)
+          ./console/wisp-console -gen-token viewer:mcp > "$W/viewer.out"
+          ./console/wisp-console -gen-token admin:ci > "$W/admin.out"
+          { sed -n 5p "$W/viewer.out"; sed -n 5p "$W/admin.out"; } | sed 's/^ *//' > "$W/roles.conf"
+          VIEWER=$(sed -n 2p "$W/viewer.out" | tr -d ' ')
+          ADMIN=$(sed -n 2p "$W/admin.out" | tr -d ' ')
+          ./console/wisp-console -dev -listen 127.0.0.1:18750 -http 127.0.0.1:18080 \
+            -roles "$W/roles.conf" -state-dir "$W" > "$W/console.log" 2>&1 &
+          CON=$!
+          trap 'kill $CON 2>/dev/null; cat "$W/console.log"' EXIT
+          for i in $(seq 40); do curl -sf -o /dev/null http://127.0.0.1:18080/readyz && break; sleep 0.25; done
+          VIEWER=$VIEWER ADMIN=$ADMIN python3 - <<'PY'
+          import json, os, subprocess, sys
+          env = dict(os.environ, WISP_URL="http://127.0.0.1:18080", WISP_TOKEN=os.environ["VIEWER"])
+          msgs = [
+              {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+               "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                          "clientInfo": {"name": "ci", "version": "0"}}},
+              {"jsonrpc": "2.0", "method": "notifications/initialized"},
+              {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+              {"jsonrpc": "2.0", "id": 3, "method": "ping"},
+              "{this is not json",
+              {"jsonrpc": "2.0", "id": 4, "method": "no/such/method"},
+              {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "wisp_fleet", "arguments": {}}},
+          ]
+          stdin = "".join((m if isinstance(m, str) else json.dumps(m)) + "\n" for m in msgs)
+          p = subprocess.run([sys.executable, "mcp/wisp_mcp.py"], input=stdin, env=env,
+                             capture_output=True, text=True, timeout=60)
+          print(p.stderr, file=sys.stderr)
+          resp = [json.loads(l) for l in p.stdout.splitlines() if l.strip()]
+          by = {r.get("id"): r for r in resp}
+          assert p.returncode == 0, p.returncode
+          assert by[1]["result"]["protocolVersion"], by[1]
+          assert len(by[2]["result"]["tools"]) >= 1, by[2]
+          assert by[3]["result"] == {}, by[3]
+          assert any(r.get("error", {}).get("code") == -32700 for r in resp), resp
+          assert by[4]["error"]["code"] == -32601, by[4]
+          assert by[5]["result"]["isError"] is False, by[5]
+          assert 1 not in [r.get("id") for r in resp if "error" in r]
+          # A non-viewer token must make the server refuse to start.
+          a = subprocess.run([sys.executable, "mcp/wisp_mcp.py"], input="", capture_output=True, text=True,
+                             timeout=60, env=dict(env, WISP_TOKEN=os.environ["ADMIN"]))
+          assert a.returncode != 0 and "REFUSING" in a.stderr, (a.returncode, a.stderr)
+          print("MCP session OK; admin token refused")
+          PY
+
+  # Release artifacts are built on the oldest supported baseline, Debian 12
+  # (glibc 2.36, libbpf.so.1, GLIBCXX_3.4.30), not on the runner's Ubuntu
+  # 24.04, so they load on Debian 12+ and Ubuntu 24.04+.
+  release:
+    name: release tarball (Debian 12 baseline)
+    runs-on: ubuntu-24.04
+    needs: build-and-test
+    container: debian:12
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates make clang llvm bpftool \
+            libbpf-dev libelf-dev zlib1g-dev libssl-dev g++ nlohmann-json3-dev binutils
+      - uses: actions/checkout@v4
+      - name: Build release tarball
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          make dist
       - uses: actions/upload-artifact@v4
         with:
           name: wisp-dist
           path: dist/*.tar.gz*
+
+  # Runs the tarball's binaries on each distribution. Debian 12 and Ubuntu
+  # 24.04 must pass. Ubuntu 22.04 (glibc 2.35, no libbpf1) and RHEL 9 / Rocky
+  # (glibc 2.34) are below that baseline: they run as informational jobs that
+  # show whether the support matrix can include them.
+  dist-smoke:
+    name: tarball runs on ${{ matrix.image }}
+    runs-on: ubuntu-24.04
+    needs: release
+    container: ${{ matrix.image }}
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { image: "debian:12", experimental: false }
+          - { image: "ubuntu:24.04", experimental: false }
+          - { image: "ubuntu:22.04", experimental: true }
+          - { image: "rockylinux:9", experimental: true }
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wisp-dist
+      - name: Install runtime libraries
+        run: |
+          if command -v apt-get >/dev/null; then
+            apt-get update
+            apt-get install -y --no-install-recommends libssl3 libelf1 zlib1g libstdc++6
+            apt-get install -y --no-install-recommends libbpf1 || echo "no libbpf1 package on this distribution"
+          else
+            dnf install -y openssl-libs elfutils-libelf zlib libstdc++ libbpf tar gzip
+          fi
+      - name: Run the binaries
+        run: |
+          sha256sum -c ./*.tar.gz.sha256
+          tar xzf "$(ls wisp-*-linux-*.tar.gz | grep -v -- -debug)"
+          cd wisp-*-linux-*/
+          ./bin/wispd --version
+          ./bin/wisp-console -version
+          bash -n packaging/install.sh
 
   integration:
     name: integration (root, eBPF)
@@ -49,7 +177,16 @@ jobs:
           sudo apt-get install -y clang llvm libbpf-dev libelf-dev zlib1g-dev libssl-dev \
             g++ nlohmann-json3-dev linux-tools-common "linux-tools-$(uname -r)" mingw-w64
       - name: Full verification suite
-        # Detection, enforcement, CPU budget, rate limiting, anomalies,
-        # forensics, console lifecycle/rollouts, MDM install. CPU figures on
-        # shared CI runners are noisier than on a dedicated host.
+        # Detection, enforcement, quarantine (of a scratch copy only), CPU
+        # budget, rate limiting, anomalies, forensics, console mTLS/lifecycle/
+        # rollouts, AI redaction, staged installs. verify.sh keeps everything
+        # in a private temp dir and stops only its own processes, but it runs
+        # as root and loads eBPF: it runs only on GitHub-hosted runners, which
+        # are fresh single-use VMs, never on a self-hosted (shared) runner.
+        # CPU figures on shared CI hardware are noisier than on a dedicated host.
+        if: runner.environment == 'github-hosted'
         run: make verify
+      - name: Skipped on a self-hosted runner
+        if: runner.environment != 'github-hosted'
+        run: |
+          echo "::warning::integration suite skipped (it runs as root; only on single-use GitHub-hosted runners)"

@@ -43,6 +43,11 @@ struct proc {
 	char pcomm[17];
 	char exe[MAX_PATH];
 	int cmd_truncated;       /* argv was longer than the captured MAX_CMD-1 bytes */
+	/* Identity across pid reuse: start time in clock ticks since boot, as
+	 * field 22 of /proc/<pid>/stat shows it (0 = not known). Every response
+	 * action re-checks it, so a recycled pid is never signalled. */
+	unsigned long long start;
+	unsigned long long pstart;  /* the parent's, same units (0 = not known) */
 	char cmd[MAX_CMD];       /* argv joined by spaces */
 	size_t cmdlen;
 };
@@ -108,6 +113,13 @@ int    parse_long(const char *s, long lo, long hi, long *out);
 int    parse_bool(const char *s, int *out);
 size_t scopy(char *dst, size_t cap, const char *src);
 ssize_t read_small(int dirfd, const char *path, char *buf, size_t cap);
+/* As read_small, for a path a user controls: never follows a final symlink,
+ * never blocks (a FIFO or device there is refused), regular files only. */
+ssize_t read_user(int dirfd, const char *path, char *buf, size_t cap);
+/* Fields of a /proc/<pid>/stat line. Returns 0, or -1 if malformed. */
+int    parse_stat(const char *buf, int *ppid, int *sid, int *tty, unsigned long long *start);
+int    proc_start(pid_t pid, unsigned long long *start); /* field 22 of /proc/<pid>/stat */
+const char *boot_tag(void); /* short id of this boot: (boot, start) names one process */
 const char *sev_name(enum sev s);
 const char *actor_name(enum actor a);
 const char *base_name(const char *p);
@@ -175,6 +187,7 @@ void inventory_dump(FILE *f);
 int  fim_init(int inotify_fd, const char *path); /* load, or reload in place */
 int  fim_reload(void);       /* re-read the fim.conf fim_init loaded; -1 = kept */
 int  fim_count(void);
+int  fim_absent(void);       /* configured paths that do not exist (watched for) */
 void fim_resync(void);       /* re-add every watch (after an inotify overflow) */
 int  fim_owns_wd(int wd);
 void fim_on_event(int wd, uint32_t mask, const char *name);
@@ -184,10 +197,10 @@ void fim_on_event(int wd, uint32_t mask, const char *name);
 void policy_reload(const char *why);
 
 /* respond.c */
-int  respond_kill(pid_t pid, const char *why);  /* SIGKILL pid and every descendant */
-/* As respond_kill, but only if pid still names the process that started at
- * start_ticks (field 22 of /proc/<pid>/stat; 0 = not known, no check). */
-int  respond_kill_if(pid_t pid, unsigned long long start_ticks, const char *why);
+/* SIGKILL pid and every descendant -- only if pid still names the process
+ * that started at start (struct proc's start: field 22 of /proc/<pid>/stat).
+ * start 0 (not known) is refused: a recycled pid must never be signalled. */
+int  respond_kill(pid_t pid, unsigned long long start, const char *why);
 /* Kill p's tree, then quarantine the executable it ran. *kill_rc gets the
  * kill result; on success dst is the quarantined copy, else err says why the
  * file was left in place. */
@@ -198,8 +211,8 @@ int  respond_unpatch(pid_t pid, unsigned long addr);
 
 /* output.c */
 void out_init(void);
-void out_flow(pid_t pid, uid_t uid, const char *comm, enum actor a, const char *asrc,
-              const char *dest, int dport, const char *verdict);
+void out_flow(pid_t pid, unsigned long long start, uid_t uid, const char *comm, enum actor a,
+              const char *asrc, const char *dest, int dport, const char *verdict);
 void out_alert(const char *rule, const char *mitre, const char *title, enum sev sev,
                const char *action, const struct proc *p, const char *extra_json);
 void out_telemetry(const struct proc *p);
@@ -213,6 +226,7 @@ const char *identity_tier(void);
 void out_inventory(const char *kind, const char *name, const char *ver,
                    const char *where, const char *change);
 void out_flush(void);
+void out_reopen(void);   /* SIGHUP: reopen the log files (logrotate) */
 
 /* console.c */
 void console_tick(void);

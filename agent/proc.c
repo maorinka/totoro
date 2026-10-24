@@ -71,7 +71,8 @@ fail:
  *
  * Kept deliberately lean: open /proc/<pid>/stat once, take the process
  * uid from fstat() on that very fd (no separate directory open), then one
- * readlink for exe and one open/read for cmdline. ~8 syscalls total.
+ * readlink for exe, one open/read for cmdline and one for the parent's start
+ * time. ~11 syscalls total.
  */
 int proc_fill(pid_t pid, struct proc *p)
 {
@@ -102,12 +103,15 @@ int proc_fill(pid_t pid, struct proc *p)
 		memcpy(p->comm, l + 1, cn);
 		p->comm[cn] = 0;
 		int ppid = 0, tty = 0;
-		char state;
-		if (sscanf(r + 2, "%c %d %*d %*d %d", &state, &ppid, &tty) == 3) {
+		if (parse_stat(buf, &ppid, NULL, &tty, &p->start) == 0) {
 			p->ppid = ppid;
 			p->has_tty = tty != 0;
 		}
 	}
+	/* The parent's start time ties this record to one parent process in
+	 * forensics (tree=), whatever reused its pid since. */
+	if (p->ppid > 0 && proc_start(p->ppid, &p->pstart) < 0)
+		p->pstart = 0;
 
 	snprintf(path, sizeof path, "/proc/%d/exe", pid);
 	n = readlink(path, p->exe, sizeof p->exe - 1);

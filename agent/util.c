@@ -6,6 +6,7 @@
 #include <string.h>
 #include <strings.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -118,18 +119,97 @@ void jstr(FILE *f, const char *key, const char *val, int comma)
 	fprintf(f, "%s\"%s\":\"%s\"", comma ? "," : "", key, buf);
 }
 
-/* One openat+read+close. Returns bytes read, NUL-terminated. */
-ssize_t read_small(int dirfd, const char *path, char *buf, size_t cap)
+/* One openat+fstat+read+close of at most cap-1 bytes, NUL-terminated.
+ * O_NONBLOCK, and only a regular file is read: the sensor is single-threaded,
+ * so a FIFO (or a device) planted where a file is expected must not be able
+ * to hang it in open() or read(). */
+static ssize_t read_reg(int dirfd, const char *path, char *buf, size_t cap, int flags)
 {
-	int fd = openat(dirfd, path, O_RDONLY | O_CLOEXEC);
+	if (!cap)
+		return -1;
+	buf[0] = 0;
+	int fd = openat(dirfd, path, O_RDONLY | O_CLOEXEC | O_NOCTTY | O_NONBLOCK | flags);
 	if (fd < 0)
 		return -1;
-	ssize_t n = read(fd, buf, cap - 1);
+	struct stat st;
+	if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) {
+		close(fd);
+		errno = EINVAL;
+		return -1;
+	}
+	ssize_t n;
+	do
+		n = read(fd, buf, cap - 1);
+	while (n < 0 && errno == EINTR);
 	close(fd);
 	if (n < 0)
 		return -1;
 	buf[n] = 0;
 	return n;
+}
+
+/* Returns bytes read, NUL-terminated. For /proc and the sensor's own files. */
+ssize_t read_small(int dirfd, const char *path, char *buf, size_t cap)
+{
+	return read_reg(dirfd, path, buf, cap, 0);
+}
+
+/* A file in a directory some user controls (a home directory, a package
+ * directory): a symlink as the last component is refused too, so the sensor
+ * cannot be pointed at a file the user could not read themselves. */
+ssize_t read_user(int dirfd, const char *path, char *buf, size_t cap)
+{
+	return read_reg(dirfd, path, buf, cap, O_NOFOLLOW);
+}
+
+/* "pid (comm) state ppid pgrp session tty_nr ... starttime(22) ...". comm
+ * may hold spaces and parentheses: parse from the last ')'. */
+int parse_stat(const char *buf, int *ppid, int *sid, int *tty, unsigned long long *start)
+{
+	const char *r = strrchr(buf, ')');
+	int pp = 0, se = 0, tt = 0;
+	unsigned long long st = 0;
+	if (!r || sscanf(r + 1, " %*c %d %*d %d %d %*d %*u %*u %*u %*u %*u %*u %*u %*d %*d %*d %*d %*d %*d %llu",
+	                 &pp, &se, &tt, &st) != 4)
+		return -1;
+	if (ppid)
+		*ppid = pp;
+	if (sid)
+		*sid = se;
+	if (tty)
+		*tty = tt;
+	if (start)
+		*start = st;
+	return 0;
+}
+
+int proc_start(pid_t pid, unsigned long long *start)
+{
+	char path[48], buf[1024];
+	snprintf(path, sizeof path, "/proc/%d/stat", (int)pid);
+	if (read_small(AT_FDCWD, path, buf, sizeof buf) <= 0)
+		return -1;
+	return parse_stat(buf, NULL, NULL, NULL, start);
+}
+
+/* The first 8 hex digits of the kernel's boot id. Start times count from
+ * boot, so records name a process by (boot, pid, start): pids and early
+ * start times repeat from one boot to the next. */
+const char *boot_tag(void)
+{
+	static char tag[9];
+	if (!tag[0]) {
+		char buf[64];
+		size_t o = 0;
+		if (read_small(AT_FDCWD, "/proc/sys/kernel/random/boot_id", buf, sizeof buf) > 0)
+			for (const char *c = buf; *c && o < 8; c++)
+				if ((*c >= '0' && *c <= '9') || (*c >= 'a' && *c <= 'f'))
+					tag[o++] = *c;
+		if (o < 8)
+			scopy(tag, sizeof tag, "00000000");
+		tag[8] = 0;
+	}
+	return tag;
 }
 
 const char *sev_name(enum sev s)

@@ -216,7 +216,8 @@ static void usage(FILE *o)
 	        "  wispd [-c CONFIG] --search F...   search this host's recorded events (forensics):\n"
 	        "        key=value  q=text  since=ISO  until=ISO  tree=PID  limit=N\n"
 	        "  wispd --version | --help\n\n"
-	        "Signals: SIGHUP reloads rules, catalog, network policy and FIM paths;\n"
+	        "Signals: SIGHUP reopens the log files and reloads rules, catalog,\n"
+	        "         network policy and FIM paths;\n"
 	        "         SIGTERM stops (the console is told goodbye).\n"
 	        "Docs: docs/configuration.md, docs/policy.md, docs/operations.md\n",
 	        WISP_VERSION);
@@ -237,9 +238,16 @@ static int check_config(const char *conf)
 	int nc = catalog_load(cfg.catalog_path);
 	int nn = netpolicy_load(cfg.netpolicy_path);
 	int ifd = inotify_init1(IN_CLOEXEC);
+	errno = 0;
 	int nf = ifd >= 0 ? fim_init(ifd, cfg.fim_path) : -1;
+	int fe = errno;
 	if (ifd >= 0)
 		close(ifd);
+	/* No fim.conf at all means no file integrity monitoring: a typo'd
+	 * "fim =" path or a missing file must not pass as OK. */
+	if (nf < 0)
+		cfg_problem(cfg.fim_path, 0, "cannot read fim config: %s (no file integrity monitoring)",
+		            ifd < 0 ? "inotify unavailable" : strerror(fe ? fe : ENOENT));
 	if (cfg.console[0]) {
 		const char *files[] = { cfg.cert, cfg.key, cfg.ca };
 		const char *what[] = { "cert", "key", "ca" };
@@ -256,7 +264,8 @@ static int check_config(const char *conf)
 	printf("rules       %d  (%s)\n", nr < 0 ? 0 : nr, cfg.rules_path);
 	printf("catalog     %s  (%s)\n", nc < 0 ? "none" : "loaded", cfg.catalog_path);
 	printf("netpolicy   %d  (%s)\n", nn < 0 ? 0 : nn, cfg.netpolicy_path);
-	printf("fim         %d watches  (%s)\n", nf < 0 ? 0 : nf, cfg.fim_path);
+	printf("fim         %d watches%s  (%s)\n", nf < 0 ? 0 : nf, fim_absent() ? ", some not present yet (see above)" : "",
+	       cfg.fim_path);
 	printf("console     %s\n", cfg.console[0] ? cfg.console : "standalone");
 	if (cfg_problems) {
 		printf("\n%d problem(s) found -- see messages above\n", cfg_problems);
@@ -415,8 +424,10 @@ int main(int argc, char **argv)
 			case TAG_SIGNAL: {
 				struct signalfd_siginfo si;
 				while (read(sigfd, &si, sizeof si) == sizeof si) {
-					if (si.ssi_signo == SIGHUP)
+					if (si.ssi_signo == SIGHUP) {
+						out_reopen(); /* logrotate's postrotate */
 						policy_reload("SIGHUP");
+					}
 					else
 						want_stop = 1;
 				}
