@@ -347,15 +347,19 @@ sys.exit(0 if x and x.get("host_id") and x.get("trust") in want else 1)' "$H" \
   && ok "identity: the real sensor reports a host_id and its trust tier ($(api /api/hosts | python3 -c 'import sys,json;h=sys.argv[1];print(next((x.get("trust") for x in json.load(sys.stdin) if x["name"]==h),"?"))' "$H"))" \
   || no "identity: host_id/trust missing for $H"
 for p in 10 50 100; do curl -s -X POST "127.0.0.1:$P_HTTP/api/policy/rollout?action=enforce&group=prod&percent=$p" >/dev/null; done
-for _ in $(seq 40); do [ "$(ls "$VC"/ctl/*.ctl 2>/dev/null | wc -l)" -ge 20 ] && break; sleep 0.25; done  # simulated hosts write one file each
+for _ in $(seq 40); do [ "$(ls "$VC"/ctl/*.ctl 2>/dev/null | wc -l)" -ge 19 ] && break; sleep 0.25; done  # each live simulated host writes one file
 rodiag=$(api /api/policy/rollout | python3 -c '
 import sys,json,glob
 rs=sorted(json.load(sys.stdin), key=lambda r: r["ts"])  # API returns newest first
 c=[set(r["cohort"]) for r in rs]
 got={f.split("/")[-1][:-4] for f in glob.glob(sys.argv[1]+"/ctl/*.ctl")}
-okk = len(c)==3 and c[0]<c[1]<c[2] and len(c[2])==20 and got==c[2]
+# prod-05 is the silent host: already stale, so it stays in the cohort but is
+# never reported delivered (a push to a stale host is not counted as delivered).
+silent={"prod-05"}
+okk = (len(c)==3 and c[0]<c[1]<c[2] and len(c[2])==20 and got==c[2]-silent
+       and not silent & set(rs[-1]["delivered"]) and len(rs[-1]["delivered"])==19)
 print("ok" if okk else "stages=%s nested=%s files=%d missing=%s extra=%s" % ([(r["percent"],len(r["cohort"]),len(r["delivered"])) for r in rs], len(c)==3 and c[0]<c[1]<c[2], len(got), sorted(c[-1]-got)[:5] if c else "-", sorted(got-c[-1])[:5] if c else "-"))' "$VC")
-[ "$rodiag" = ok ] && ok "staged rollout 10%→50%→100%: nested cohorts, all 20 hosts received the push, other groups untouched" || no "staged rollout: $rodiag"
+[ "$rodiag" = ok ] && ok "staged rollout 10%→50%→100%: nested cohorts, all 19 live hosts received the push, the stale one is not reported delivered" || no "staged rollout: $rodiag"
 sleep 1.5
 api '/api/hosts?state=stale' | grep -q '"prod-05"' && ok "silent host transitions to stale" || no "stale state"
 api /api/posture | python3 -c 'import sys,json;p=json.load(sys.stdin);sys.exit(0 if len(p["hosts"])>=20 and p["hosts"][0]["findings"] else 1)' \
