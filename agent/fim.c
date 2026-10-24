@@ -24,6 +24,7 @@
 #include <string.h>
 #include <sys/inotify.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #define MAX_FIM 128
 #define M_FILE (IN_MODIFY | IN_ATTRIB | IN_CLOSE_WRITE | IN_DELETE_SELF | IN_MOVE_SELF)
@@ -161,6 +162,14 @@ static int arm_parent(struct fwatch *e)
 	return e->pwd;
 }
 
+/* A permission error is only a configuration problem for the sensor itself,
+ * which runs as root. --check-config run unprivileged (CI, a policy repo)
+ * cannot open root-only paths such as /etc/shadow, so it notes them instead. */
+static int unprivileged_denial(int err)
+{
+	return (err == EACCES || err == EPERM) && geteuid() != 0;
+}
+
 /* Arm a freshly loaded entry and say what it covers. A path that does not
  * exist is a warning (it is watched for); one that cannot be watched for
  * another reason is a configuration problem. */
@@ -172,7 +181,10 @@ static void arm_new(struct fwatch *e, const char *file)
 	int se = errno;
 	if (se == ENOENT || se == ENOTDIR)
 		nabsent++;
-	if (se != ENOENT && se != ENOTDIR)
+	if (unprivileged_denial(se))
+		logmsg("fim: %s:%d: cannot check %s as uid %d (%s); the sensor runs as root", file, e->line,
+		       e->path, (int)geteuid(), strerror(se));
+	else if (se != ENOENT && se != ENOTDIR)
 		cfg_problem(file, e->line, "cannot watch %s: %s", e->path, strerror(se));
 	else if (pw >= 0)
 		logmsg("fim: %s:%d: %s does not exist; watching %s for it to appear", file, e->line, e->path,
@@ -180,6 +192,9 @@ static void arm_new(struct fwatch *e, const char *file)
 	else if (pe == ENOENT || pe == ENOTDIR)
 		logmsg("fim: %s:%d: neither %s nor its directory exists: not watched (until a reload)", file,
 		       e->line, e->path);
+	else if (unprivileged_denial(pe))
+		logmsg("fim: %s:%d: cannot check %s or its directory as uid %d (%s); the sensor runs as root",
+		       file, e->line, e->path, (int)geteuid(), strerror(pe));
 	else
 		cfg_problem(file, e->line, "cannot watch %s or its directory: %s", e->path, strerror(pe));
 }
