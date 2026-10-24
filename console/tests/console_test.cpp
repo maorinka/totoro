@@ -1635,6 +1635,10 @@ TEST(IngestTlsResumptionAndHandshakeFailuresAreLogged) {
 	});
 	CHECK(log.find("ingest: TLS handshake with 127.0.0.1:") != std::string::npos);
 	CHECK(log.find("failed:") != std::string::npos);
+	// The session carries the client certificate; the host records it.
+	CHECK(li.eventually([&] { auto h = li.env.st.host_snapshot("tls-1"); return h && !h->cert_fp.empty(); }));
+	auto h = li.env.st.host_snapshot("tls-1");
+	CHECK(h && h->cert_fp.size() == 64 && h->cert_name == "CN=127.0.0.1");
 }
 
 TEST(SlackTextEscapesSensorFields) {
@@ -1734,6 +1738,10 @@ TEST(FlagValidation) {
 	CHECK_EQ(c.journal_max_mb, 0);
 	CHECK_EQ(flags({"-ai-max-per-hour", "+5"}), 2);
 	CHECK_EQ(flags({"-max-sensors", "0"}), 2);
+	CHECK(c.max_hosts == 100000 && c.max_hosts_per_cert == 0 && !c.http_proxy_local);
+	CHECK_EQ(flags({"-max-hosts", "0"}), 2);
+	CHECK_EQ(flags({"-max-hosts-per-cert", "50", "-max-hosts", "2000", "-http-local-proxy"}, &c), -1);
+	CHECK(c.max_hosts == 2000 && c.max_hosts_per_cert == 50 && c.http_proxy_local);
 	CHECK_EQ(flags({"-http-key", "k.pem"}), 2);  // would have served plain HTTP
 	CHECK_EQ(flags({"-cert", "c.pem"}), 2);
 	CHECK_EQ(flags({"-slack", "http://hooks.example/x"}), 2);
@@ -1748,9 +1756,634 @@ TEST(FlagValidation) {
 	CHECK_EQ(flags({"-nope"}), 2);
 }
 
+// ---- store: audit, closed journal, certificates, bounds -----------------------------
+
+TEST(AuditRecordsAreConsoleOnlyAndKeptWithSecurityRecords) {
+	Env e;
+	SensorSession s{"", std::make_shared<FakeLink>()};
+	e.st.sensor_line(s, R"({"type":"hello","host":"web-1"})");
+	e.st.sensor_line(s, R"({"type":"audit","host":"web-1","op":"vault_write","key":"forged","by":"admin"})");
+	CHECK_EQ(e.st.search_events({{"type", {"audit"}}}).size(), (size_t)0);
+	CHECK_EQ(e.req("PUT", "/api/vault?key=db/pw", TOK_ADMIN, "hunter2").status, 200);
+	// Telemetry floods the search index; the audit record stays.
+	e.st.journal_keep = 20;
+	for (int i = 0; i < 100; i++)
+		e.send({{"type", "flow"}, {"host", "web-1"}, {"dest", "10.0.0." + std::to_string(i)}});
+	auto a = e.st.search_events({{"type", {"audit"}}});
+	CHECK(a.size() == 1 && a[0]["key"] == "db/pw");
+	// A sensor line typed "audit" in an older format-2 segment (where it was
+	// not refused yet) carries no console marker: never replayed.
+	std::string path = e.st.journal_path();
+	e.st.close_journal();
+	std::string body = read_file(path).value_or("") +
+	                   R"({"ts":"2026-01-01T00:00:00Z","type":"audit","host":"web-1","op":"vault_write","rx_ts":"x"})" "\n";
+	std::string err;
+	write_file_atomic(path, body, 0600, &err);
+	Store st2;
+	st2.open_journal(path);
+	CHECK_EQ(st2.search_events({{"type", {"audit"}}}).size(), (size_t)1);
+	st2.close_journal();
+}
+
+TEST(RecordsAfterTheJournalClosesAreRefusedNotKeptInMemory) {
+	Env e;
+	e.send({{"ts", now_ts()}, {"type", "alert"}, {"host", "web-1"}, {"rule", "R"}, {"severity", "high"}});
+	std::string id = e.st.alert_list({})[0]["id"];
+	e.st.close_journal();
+	std::string log = capture_log([&] {
+		bool threw = false;
+		try {
+			e.st.record_console({{"type", "suggestion"}, {"id", "S-late"}});
+		} catch (const std::runtime_error &) {
+			threw = true;
+		}
+		CHECK(threw);
+		threw = false;
+		try {
+			e.st.triage(id, "resolved", "late", "olive");
+		} catch (const std::runtime_error &) {
+			threw = true;
+		}
+		CHECK(threw);
+	});
+	CHECK(log.find("is closed; refused") != std::string::npos);
+	CHECK_EQ(e.st.alert_list({})[0]["status"].get<std::string>(), std::string("open"));
+	CHECK_EQ(e.st.search_events({{"id", {"S-late"}}}).size(), (size_t)0);
+	CHECK(read_file(e.st.journal_path()).value_or("").find("S-late") == std::string::npos);
+	// The audit helper logs instead of throwing into the request.
+	CHECK_EQ(e.req("POST", "/api/policy/push?host=x&action=reload", TOK_OPERATOR).status, 200);
+}
+
+TEST(ConsoleRecordsWithInvalidUtf8AreWritten) {
+	Env e;
+	e.st.record_console({{"type", "suggestion"}, {"id", "S-bad"}, {"title", std::string("caf\xe9")}});
+	std::string j = read_file(e.st.journal_path()).value_or("");
+	CHECK(j.find("\"id\":\"S-bad\"") != std::string::npos);
+	CHECK(j.find("caf\xef\xbf\xbd") != std::string::npos);  // U+FFFD
+	// ...and so are audit records naming a non-UTF-8 host.
+	e.st.audit_secret_access(std::string("k\xff"), "olive");
+	CHECK(read_file(e.st.journal_path()).value_or("").find("VAULT-ACCESS") != std::string::npos);
+}
+
+TEST(StolenCertificateCannotTakeOverAHost) {
+	Env e;
+	auto real = std::make_shared<FakeLink>(), thief = std::make_shared<FakeLink>();
+	SensorSession sr{"", real}, st{"", thief};
+	sr.cert_fp = std::string(64, 'a');
+	sr.cert_name = "CN=db-1";
+	st.cert_fp = std::string(64, 'b');
+	st.cert_name = "CN=laptop-9";  // another host's certificate
+	const char *hello = R"({"type":"hello","host":"db-1","host_id":"tpm-secret-id","trust":"tpm","group":"prod"})";
+	e.st.sensor_line(sr, hello);
+	CHECK_EQ(e.st.host_snapshot("db-1")->cert_fp, sr.cert_fp);
+	// The same (copied) identity with another certificate: alert, and the
+	// real sensor keeps the control link.
+	e.st.sensor_line(st, hello);
+	auto a = e.st.alert_list({{"rule", {"HOST-ID-MISMATCH"}}});
+	CHECK_EQ(a.size(), (size_t)1);
+	CHECK(a.size() == 1 && a[0]["title"].get<std::string>().find("certificate") != std::string::npos);
+	CHECK(e.st.push_control("db-1", "x"));
+	CHECK(real->sent.size() == 1 && thief->sent.empty());
+	// Still not once the real sensor is gone: it never becomes the control link.
+	e.st.sensor_closed(sr);
+	CHECK(!e.st.push_control("db-1", "y"));
+	CHECK(thief->sent.empty());
+	// Nor can it retire the host.
+	e.st.sensor_line(st, R"({"type":"bye","host":"db-1","reason":"x"})");
+	CHECK(e.st.host_snapshot("db-1")->decommissioned.empty());
+	CHECK_EQ(e.st.host_snapshot("db-1")->cert_fp, sr.cert_fp);
+	// A renewed certificate (same subject, same identity, nothing on the old
+	// one connected) is accepted, and flagged.
+	auto renewed = std::make_shared<FakeLink>();
+	SensorSession sn{"", renewed};
+	sn.cert_fp = std::string(64, 'c');
+	sn.cert_name = "CN=db-1";
+	e.st.sensor_line(sn, hello);
+	CHECK_EQ(e.st.host_snapshot("db-1")->cert_fp, sn.cert_fp);
+	CHECK(e.st.push_control("db-1", "z") && renewed->sent.size() == 1);
+	CHECK_EQ(e.st.alert_list({{"rule", {"HOST-ID-MISMATCH"}}}).size(), (size_t)2);
+	// Mismatch alerts never echo the recorded host_id an impostor would need.
+	SensorSession si{"", std::make_shared<FakeLink>()};
+	si.cert_fp = sn.cert_fp;
+	si.cert_name = sn.cert_name;
+	e.st.sensor_line(si, R"({"type":"hello","host":"db-1","host_id":"other","trust":"tpm"})");
+	for (auto &x : e.st.alert_list({{"rule", {"HOST-ID-MISMATCH"}}}))
+		CHECK(x.dump().find("tpm-secret-id") == std::string::npos);
+	// The recorded certificate survives a restart; a sensor cannot forge it.
+	SensorSession sf{"", std::make_shared<FakeLink>()};
+	e.st.sensor_line(sf, R"({"type":"hello","host":"web-5","cert_fp":"forged","cert_refused":true})");
+	CHECK(e.st.host_snapshot("web-5")->cert_fp.empty());
+	std::string path = e.st.journal_path();
+	Store st2;
+	st2.open_journal(path);
+	CHECK_EQ(st2.host_snapshot("db-1")->cert_fp, sn.cert_fp);
+	CHECK(st2.host_snapshot("web-5")->cert_fp.empty());
+	st2.close_journal();
+}
+
+TEST(HostCountsAreBoundedInAllAndPerCertificate) {
+	Env e;
+	e.st.max_hosts = 3;
+	e.st.max_hosts_per_cert = 2;
+	std::vector<SensorSession> s;
+	for (int i = 0; i < 6; i++)
+		s.push_back({"", std::make_shared<FakeLink>()});
+	for (int i = 0; i < 3; i++)
+		s[i].cert_fp = "shared";
+	s[3].cert_fp = "own-3";
+	s[4].cert_fp = "own-4";
+	s[5].cert_fp = "shared";
+	std::string log = capture_log([&] {
+		for (int i = 0; i < 5; i++)
+			e.st.sensor_line(s[i], json{{"type", "hello"}, {"host", "h" + std::to_string(i)}}.dump());
+	});
+	CHECK(e.st.host_snapshot("h0") && e.st.host_snapshot("h1"));
+	CHECK(!e.st.host_snapshot("h2"));  // a third host on one certificate
+	CHECK(e.st.host_snapshot("h3"));
+	CHECK(!e.st.host_snapshot("h4"));  // a fourth host in all
+	CHECK(log.find("refused") != std::string::npos);
+	CHECK(s[2].host.empty() && s[4].host.empty());  // those connections stay unbound
+	// Known hosts reconnect freely.
+	e.st.sensor_line(s[5], R"({"type":"hello","host":"h1"})");
+	CHECK_EQ(s[5].host, std::string("h1"));
+	// Retiring hosts frees room (counted again by the reaper).
+	e.st.sensor_line(s[3], R"({"type":"bye","host":"h3"})");
+	e.st.decom_after = std::chrono::nanoseconds(0);
+	e.st.sensor_closed(s[3]);
+	e.st.ingest(event_from_json({{"type", "lifecycle"}, {"host", "h3"}, {"change", "decommissioned"}, {"reason", "retired"}}), "{}");
+	e.st.reap();
+	e.st.sensor_line(s[4], R"({"type":"hello","host":"h4"})");
+	CHECK(e.st.host_snapshot("h4"));
+}
+
+TEST(AlertWindowIsBoundedByBytes) {
+	Env e;
+	e.st.max_ring_bytes = 128 << 10;
+	for (int h = 0; h < 5; h++)
+		e.send({{"ts", now_ts()}, {"type", "alert"}, {"host", "quiet-" + std::to_string(h)}, {"rule", "Q"},
+		        {"severity", "high"}});
+	std::string pad(6000, 'x');
+	for (int i = 0; i < 100; i++)  // ~600 KB of alerts from one host, far under the count cap
+		e.send({{"ts", now_ts()}, {"type", "alert"}, {"host", "noisy"}, {"rule", "N"}, {"cmd", pad}});
+	CHECK_EQ(e.st.alert_list({{"rule", {"Q"}}}).size(), (size_t)5);
+	size_t noisy = e.st.alert_list({{"rule", {"N"}}, {"limit", {"5000"}}}).size();
+	CHECK(noisy > 5 && noisy < 25);
+	// Evicted alerts are gone from the id index too.
+	CHECK(e.st.alerts_copy().size() == noisy + 5);
+}
+
+TEST(StaleHostsAreNotReportedDelivered) {
+	Env e;
+	auto link = std::make_shared<FakeLink>();
+	SensorSession s{"", link};
+	e.st.sensor_line(s, R"({"type":"hello","host":"lap-1","group":"g"})");
+	CHECK(e.st.push_control("lap-1", "x"));
+	e.st.stale_after = std::chrono::milliseconds(50);
+	std::this_thread::sleep_for(std::chrono::milliseconds(80));
+	CHECK_EQ(e.st.host_list("stale", "").size(), (size_t)1);
+	CHECK(!e.st.push_control("lap-1", "y"));
+	Rollout r = e.st.rollout("enforce", "g", 100, "dee");
+	CHECK(r.delivered.empty() && r.failed.size() == 1 && r.send_failed.empty());
+	CHECK_EQ(link->sent.size(), (size_t)1);
+	// Heard from again: deliverable again.
+	e.st.sensor_line(s, R"({"type":"heartbeat","host":"lap-1"})");
+	CHECK(e.st.push_control("lap-1", "z"));
+}
+
+TEST(LargeRolloutRecordsAreSplitAndReplayJoined) {
+	CHECK(Store().max_record < (1u << 20));  // what every release (Go 1.0 included) replays
+	Env e;
+	e.st.max_record = 8 << 10;  // the same splitting, at a size the sanitizers parse quickly
+	std::string pad(40, 'n');
+	for (int i = 0; i < 300; i++)
+		e.send({{"type", "hello"}, {"host", pad + std::to_string(i)}, {"group", "big"}});
+	Rollout r = e.st.rollout("reload", "big", 100, "dee");
+	CHECK_EQ(r.cohort.size(), (size_t)300);
+	std::string j = read_file(e.st.journal_path()).value_or("");
+	size_t longest = 0, parts = 0;
+	for (size_t a = 0, b; a < j.size(); a = b + 1) {
+		b = j.find('\n', a);
+		if (b == std::string::npos)
+			b = j.size();
+		longest = std::max(longest, b - a);
+		parts += j.compare(a, 30, R"({"action":"reload","by":"dee",)") == 0;
+	}
+	CHECK(longest <= e.st.max_record);
+	CHECK(parts >= 4);  // the intent and the outcome, each in parts
+	std::string path = e.st.journal_path();
+	e.st.close_journal();
+	{
+		Store st2;
+		st2.open_journal(path);
+		auto ro = st2.rollouts_json();
+		CHECK(ro.size() == 1 && ro[0]["cohort"].size() == 300 && ro[0]["failed"].size() == 300);
+		CHECK(ro.size() == 1 && ro[0]["status"] == "complete");
+		st2.close_journal();
+	}
+	// The console died after writing only part of the outcome: shown, as interrupted.
+	std::string cut = j.substr(0, j.rfind(R"({"action":"reload")"));
+	std::string err;
+	write_file_atomic(path, cut, 0600, &err);
+	Store st3;
+	st3.open_journal(path);
+	auto ro = st3.rollouts_json();
+	CHECK(ro.size() == 1 && ro[0]["status"] == "interrupted" && ro[0]["cohort"].size() < 300);
+	st3.close_journal();
+}
+
+// ---- HTTP: errors, paths, per-client limits, HTTPS client ------------------------------
+
+// A server on a loopback port with the given handler, torn down safely.
+struct TestHttp {
+	Listener ln{"127.0.0.1:0"};
+	HttpServer srv;
+	std::thread th;
+	TestHttp(Handler h, SSL_CTX *tls = nullptr, int per_source = 0, bool exempt = false) : srv(std::move(h), tls) {
+		if (per_source)
+			srv.max_conns_per_source = per_source;
+		srv.exempt_loopback = exempt;
+		th = std::thread([this] { srv.serve(ln, std::chrono::milliseconds(100)); });
+	}
+	~TestHttp() {
+		ln.close();
+		th.join();
+		srv.abort_connections(std::chrono::seconds(3));
+	}
+	std::string exchange(const std::string &raw) {
+		int fd = dial(ln.port());
+		send_str(fd, raw);
+		std::string out = recv_for(fd, 3000);
+		close(fd);
+		return out;
+	}
+};
+
+TEST(HttpErrorsCarrySecurityHeadersAndHeadHasNoBody) {
+	TestHttp t([](const Request &rq, Response &) {
+		if (rq.path == "/boom")
+			throw std::runtime_error("boom");
+	});
+	for (std::string raw : {"GET /boom HTTP/1.1\r\nHost: x\r\n\r\n", "GET / HTTP/1.1\r\nHost : x\r\n\r\n"}) {
+		std::string r = t.exchange(raw);
+		CHECK(r.rfind("HTTP/1.1 ", 0) == 0 && (r[9] == '5' || r[9] == '4'));
+		CHECK(r.find("Content-Security-Policy: default-src 'self'") != std::string::npos);
+		CHECK(r.find("X-Frame-Options: DENY") != std::string::npos);
+		CHECK(r.find("X-Content-Type-Options: nosniff") != std::string::npos);
+		CHECK(r.find("\"error\"") != std::string::npos);
+	}
+	std::string h = t.exchange("HEAD / HTTP/1.1\r\n\r\n");  // missing Host: 400, but HEAD
+	CHECK(h.rfind("HTTP/1.1 400", 0) == 0);
+	CHECK(h.find("Content-Length: ") != std::string::npos);
+	CHECK(h.size() == h.find("\r\n\r\n") + 4);  // no body
+	std::string hb = t.exchange("HEAD /boom HTTP/1.1\r\nHost: x\r\n\r\n");
+	CHECK(hb.rfind("HTTP/1.1 500", 0) == 0 && hb.size() == hb.find("\r\n\r\n") + 4);
+}
+
+TEST(HttpRefusesEncodedSlashInPath) {
+	LiveServer s;
+	auto vault = s.exchange("GET /api%2Fvault HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer " + TOK_ADMIN + "\r\n\r\n");
+	CHECK(vault.rfind("HTTP/1.1 400", 0) == 0);
+	CHECK(vault.find("encoded '/'") != std::string::npos);
+	CHECK(s.exchange("GET /api%2fvault HTTP/1.1\r\nHost: x\r\n\r\n").rfind("HTTP/1.1 400", 0) == 0);
+	// other encodings still decode
+	CHECK(s.exchange("GET /api/vers%69on HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer " + TOK_ADMIN + "\r\n\r\n")
+	          .rfind("HTTP/1.1 200", 0) == 0);
+}
+
+TEST(HttpPerClientLimitAppliesToLoopbackUnlessExempt) {
+	CHECK_EQ(HttpServer(Handler(), nullptr).max_conns_per_source * 16, HttpServer::max_conns);
+	auto ok = [](const Request &, Response &r) { r.body = "ok"; };
+	for (bool exempt : {false, true}) {
+		TestHttp t(ok, nullptr, 2, exempt);
+		int a = dial(t.ln.port()), b = dial(t.ln.port());
+		int c = dial(t.ln.port());
+		bool eof = false;
+		std::string got = recv_for(c, 500, &eof);
+		CHECK_EQ(eof, !exempt);  // refused at once, unless loopback is exempt
+		if (exempt) {
+			send_str(c, "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+			CHECK(recv_for(c, 2000).rfind("HTTP/1.1 200", 0) == 0);
+		}
+		close(a);
+		close(b);
+		close(c);
+	}
+}
+
+TEST(HttpsClientVerifiesIpLiteralUrls) {
+	TempDir d;
+	auto mk = [&](const std::string &name, const std::string &san) {
+		std::string cmd = "openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 -subj /CN=wisp "
+		                  "-addext subjectAltName=" + san + " -keyout " + d.path + "/" + name + ".key -out " + d.path +
+		                  "/" + name + ".crt >/dev/null 2>&1";
+		return system(cmd.c_str()) == 0;
+	};
+	CHECK(mk("ip", "IP:127.0.0.1"));
+	CHECK(mk("dns", "DNS:localhost"));
+	unsetenv("HTTPS_PROXY");
+	unsetenv("https_proxy");
+	for (std::string name : {"ip", "dns"}) {
+		auto ctx = make_server_ctx(d.path + "/" + name + ".crt", d.path + "/" + name + ".key", "");
+		TestHttp t([](const Request &, Response &r) { r.body = "ok"; }, ctx.get());
+		auto r = https_request("GET", "https://127.0.0.1:" + std::to_string(t.ln.port()) + "/", {}, "",
+		                       std::chrono::seconds(3), d.path + "/" + name + ".crt");
+		if (name == "ip")
+			CHECK(r.status == 200 && r.body == "ok");
+		else
+			CHECK(r.status == -1);  // the certificate does not name the address
+	}
+}
+
+// ---- suggestions: who may decide --------------------------------------------------------
+
+TEST(DecideRouteUsesEachSuggestionsRole) {
+	Env e;
+	Analyst an(e.st);
+	App app{e.st, &an, nullptr};
+	auto req = [&](const std::string &tok, const json &body) {
+		Request r;
+		r.method = "POST";
+		r.path = "/api/suggestions/decide";
+		r.headers["authorization"] = "Bearer " + tok;
+		r.body = body.dump();
+		Response resp;
+		handle(app, r, resp);
+		return resp;
+	};
+	e.send({{"type", "hello"}, {"host", "web-1"}, {"group", "prod"}, {"host_id", "i"}});
+	auto mk = [&](const std::string &source, const json &action, const std::string &key) {
+		Suggestion s;
+		s.kind = "x";
+		s.title = "t";
+		s.source = source;
+		s.key = key;
+		s.action = action;
+		return an.propose(s).id;
+	};
+	json manual = {{"type", "manual"}, {"instructions", "rotate the key"}};
+	json rollout = {{"type", "rollout"}, {"group", "prod"}, {"control", "enforce"}, {"percent", 10}};
+	json rollout50 = {{"type", "rollout"}, {"group", "prod"}, {"control", "enforce"}, {"percent", 50}};
+	std::string m1 = mk("engine", manual, "m1"), m2 = mk("engine", manual, "m2"), ai = mk("ai", manual, "a1"),
+	            ro = mk("ai", rollout, "r1"), hro = mk("engine", rollout50, "r2");
+	// /api/suggestions says what the caller may decide.
+	auto list = [&](const std::string &tok) {
+		Request q;
+		q.method = "GET";
+		q.path = "/api/suggestions";
+		q.query = parse_query("status=all");
+		q.headers["authorization"] = "Bearer " + tok;
+		Response resp;
+		handle(app, q, resp);
+		std::map<std::string, bool> out;
+		for (auto &j : body_json(resp))
+			out[j["id"].get<std::string>()] = j["can_approve"].get<bool>();
+		return out;
+	};
+	auto dl = list(TOK_DEPLOYER), ol = list(TOK_OPERATOR), vl = list(TOK_VIEWER);
+	CHECK(!dl[m1] && !dl[ai] && !dl[ro] && dl[hro]);
+	CHECK(ol[m1] && ol[ai] && ol[ro] && ol[hro]);
+	CHECK(!vl[m1] && !vl[hro]);
+	// A deployer is refused at the route for an operator suggestion, before anything is decided.
+	auto r = req(TOK_DEPLOYER, {{"id", m1}, {"decision", "approve"}});
+	CHECK_EQ(r.status, 403);
+	CHECK(r.body.find("needs the operator role") != std::string::npos);
+	CHECK_EQ(an.suggestion(m1)->status, std::string("proposed"));
+	CHECK_EQ(req(TOK_DEPLOYER, {{"id", m2}, {"decision", "reject"}}).status, 403);
+	CHECK_EQ(req(TOK_VIEWER, {{"id", m1}, {"decision", "approve"}}).status, 403);
+	// An operator approves a non-rollout suggestion.
+	CHECK_EQ(req(TOK_OPERATOR, {{"id", m1}, {"decision", "approve"}}).status, 200);
+	CHECK(an.suggestion(m1)->status != "proposed");
+	// AI suggestions never need less than operator: a deployer (automation)
+	// token cannot approve an AI-proposed rollout; an engine rollout it can.
+	Suggestion s;
+	s.source = "ai";
+	s.action = manual;
+	CHECK_EQ(decide_role(s), std::string("operator"));
+	s.action = rollout;
+	CHECK_EQ(decide_role(s), std::string("operator"));
+	s.source = "analysis";
+	CHECK_EQ(decide_role(s), std::string("deployer"));
+	CHECK_EQ(req(TOK_DEPLOYER, {{"id", ai}, {"decision", "approve"}}).status, 403);
+	CHECK_EQ(req(TOK_DEPLOYER, {{"id", ro}, {"decision", "approve"}}).status, 403);
+	CHECK_EQ(an.suggestion(ro)->status, std::string("proposed"));
+	CHECK_EQ(req(TOK_OPERATOR, {{"id", ro}, {"decision", "reject"}}).status, 200);
+	CHECK_EQ(an.suggestion(ro)->status, std::string("rejected"));
+	CHECK_EQ(req(TOK_DEPLOYER, {{"id", hro}, {"decision", "reject"}}).status, 200);
+	CHECK_EQ(an.suggestion(hro)->status, std::string("rejected"));
+}
+
+TEST(UnreadableAiKeyFileOnlyDisablesTheAssistant) {
+	TempDir d;
+	std::string key, why;
+	CHECK(!read_ai_key_file(d.path + "/missing", &key, &why));
+	CHECK(why.find("unavailable") != std::string::npos);
+	std::string err;
+	write_file_atomic(d.path + "/k", "  sk-test\n", 0600, &err);
+	CHECK(read_ai_key_file(d.path + "/k", &key, &why) && key == "sk-test");
+	Env e;
+	Analyst an(e.st);
+	App app{e.st, &an, nullptr, "-ai-key-file x is unreadable or empty; the AI assistant is unavailable"};
+	Request r;
+	r.method = "GET";
+	r.path = "/api/ai/status";
+	r.headers["authorization"] = "Bearer " + TOK_VIEWER;
+	Response resp;
+	handle(app, r, resp);
+	CHECK(resp.status == 200 && body_json(resp)["enabled"] == false &&
+	      body_json(resp)["reason"].get<std::string>().find("unreadable") != std::string::npos);
+}
+
+TEST(SummaryCountsOpenIncidentsByPriority) {
+	Env e;
+	Analyst an(e.st);
+	App app{e.st, &an, nullptr};
+	for (int h = 0; h < 3; h++)
+		e.send({{"ts", now_ts()}, {"type", "alert"}, {"host", "web-" + std::to_string(h)},
+		        {"rule", "TEST-" + std::to_string(h)}, {"severity", h == 0 ? "critical" : "low"}});
+	Request r;
+	r.method = "GET";
+	r.path = "/api/summary";
+	r.headers["authorization"] = "Bearer " + TOK_VIEWER;
+	Response resp;
+	handle(app, r, resp);
+	auto io = body_json(resp)["incidents_open"];
+	int n = 0;
+	for (auto p : {"P1", "P2", "P3", "P4"})
+		n += io["by_priority"][p].get<int>();
+	CHECK_EQ(io["total"].get<int>(), 3);
+	CHECK_EQ(n, 3);
+	// Resolving one leaves it out.
+	auto incs = an.incidents();
+	an.triage_incident(incs.front().id, "resolved", "done", "olive");
+	Response r2;
+	handle(app, r, r2);
+	CHECK_EQ(body_json(r2)["incidents_open"]["total"].get<int>(), 2);
+	// A bare store (no analysis engine) has no such field.
+	CHECK(!body_json(e.req("GET", "/api/summary", TOK_VIEWER)).contains("incidents_open"));
+}
+
+// ---- RBAC matrix (R200) -------------------------------------------------------------
+
+TEST(EveryApiRouteEnforcesItsRole) {
+	Env e;
+	Analyst an(e.st);
+	App app{e.st, &an, nullptr};
+	struct Route {
+		const char *method, *target, *min;  // min "" = public
+	};
+	const Route routes[] = {
+	    {"GET", "/api/session", ""},
+	    {"GET", "/api/version", "viewer"},
+	    {"GET", "/api/me", "viewer"},
+	    {"GET", "/api/summary", "viewer"},
+	    {"GET", "/api/hosts", "viewer"},
+	    {"GET", "/api/hosts/detail?name=x", "viewer"},
+	    {"GET", "/api/alerts", "viewer"},
+	    {"POST", "/api/alerts/triage", "operator"},
+	    {"GET", "/api/vulns", "viewer"},
+	    {"GET", "/api/inventory", "viewer"},
+	    {"GET", "/api/events", "viewer"},
+	    {"GET", "/api/posture", "viewer"},
+	    {"GET", "/api/policy/rollout", "viewer"},
+	    {"POST", "/api/policy/rollout", "deployer"},
+	    {"POST", "/api/policy/push", "operator"},
+	    {"GET", "/api/vault", "operator"},
+	    {"GET", "/api/vault?key=nope", "operator"},
+	    {"PUT", "/api/vault", "admin"},
+	    {"POST", "/api/vault", "admin"},
+	    {"GET", "/api/incidents", "viewer"},
+	    {"GET", "/api/incidents/detail?id=x", "viewer"},
+	    {"POST", "/api/incidents/triage", "operator"},
+	    {"GET", "/api/analysis/health", "viewer"},
+	    {"GET", "/api/analysis/rules", "viewer"},
+	    {"POST", "/api/analysis/run", "operator"},
+	    {"GET", "/api/suggestions", "viewer"},
+	    {"POST", "/api/suggestions/decide", "deployer"},
+	    {"GET", "/api/ai/status", "viewer"},
+	    {"GET", "/api/ai/jobs", "operator"},
+	    {"POST", "/api/ai/triage", "operator"},
+	    {"POST", "/api/ai/curate", "operator"},
+	    {"POST", "/api/ai/ask", "operator"},
+	};
+	const std::pair<std::string, std::string> who[] = {
+	    {"", ""}, {TOK_VIEWER, "viewer"}, {TOK_DEPLOYER, "deployer"}, {TOK_OPERATOR, "operator"}, {TOK_ADMIN, "admin"}};
+	for (auto &rt : routes)
+		for (auto &[tok, role] : who) {
+			Request r;
+			r.method = rt.method;
+			std::string target = rt.target;
+			auto qm = target.find('?');
+			r.path = target.substr(0, qm);
+			if (qm != std::string::npos)
+				r.query = parse_query(target.substr(qm + 1));
+			if (!tok.empty())
+				r.headers["authorization"] = "Bearer " + tok;
+			r.body = "{}";
+			Response resp;
+			handle(app, r, resp);
+			int want = 0;  // 0: allowed (any status but 401/403)
+			if (*rt.min && tok.empty())
+				want = 401;
+			else if (*rt.min && role_rank(role) < role_rank(rt.min))
+				want = 403;
+			bool ok = want ? resp.status == want : resp.status != 401 && resp.status != 403;
+			if (!ok)
+				fprintf(stderr, "    %s %s as %s -> %d\n", rt.method, rt.target, role.empty() ? "anonymous" : role.c_str(),
+				        resp.status);
+			CHECK(ok);
+		}
+	// What the MCP server reads at startup: its token's role.
+	Request me;
+	me.method = "GET";
+	me.path = "/api/me";
+	me.headers["authorization"] = "Bearer " + TOK_DEPLOYER;
+	Response mr;
+	handle(app, me, mr);
+	CHECK(mr.status == 200 && body_json(mr)["role"] == "deployer" && body_json(mr)["name"] == "dee");
+}
+
+// ---- golden journal from the previous releases (R190) ---------------------------------
+
+TEST(PreviousReleaseJournalReplays) {
+	// tests/fixtures/journal-1.x: a rotated segment as the Go 1.0 console wrote
+	// it (no header, alerts with and without ids, Go-shaped triage, rollout and
+	// lifecycle records, console alerts) and a current segment as the 1.1 C++
+	// console wrote it (format-2 header, rx_ts, rollout intent and outcome, an
+	// intent the console died after, suggestion, decision, AI result, audit).
+	TempDir d;
+	// (Stored under other names: the repository ignores events.jsonl*.)
+	for (auto [from, to] : {std::pair{"current.jsonl.txt", "events.jsonl"}, std::pair{"rotated.jsonl.txt", "events.jsonl.1"}}) {
+		auto body = read_file(std::string("tests/fixtures/journal-1.x/") + from);
+		CHECK(body.has_value());
+		std::string err;
+		write_file_atomic(d.path + "/" + to, body.value_or(""), 0600, &err);
+	}
+	Store st;
+	st.vulndb = VulnDB::load("");
+	Analyst an(st);
+	st.replay_hook = [&](const json &r) { an.replay(r); };
+	st.open_journal(d.path + "/events.jsonl");
+	// hosts
+	auto web1 = st.host_snapshot("web-1");
+	CHECK(web1 && web1->group == "prod" && web1->host_id == "tpm-web-1" && web1->trust == "tpm" &&
+	      web1->version == "1.0.0" && web1->alerts == 2);
+	auto db1 = st.host_snapshot("db-1");
+	CHECK(db1 && db1->trust == "dmi" && db1->version == "0.9.0" && db1->decommissioned.empty());
+	auto ci = st.host_snapshot("ci-7");
+	CHECK(ci && ci->ephemeral && ci->decommissioned == "ephemeral-exit");
+	auto web2 = st.host_snapshot("web-2");
+	CHECK(web2 && web2->host_id == "tpm-web-2" && !web2->connected);
+	CHECK(web2 && fmt_rfc3339(web2->first_seen).rfind("2026-03-02T00:00:01", 0) == 0);  // rx_ts, not ts
+	CHECK(!st.host_snapshot("console"));
+	// alerts and triage
+	auto all = st.alert_list({{"status", {"all"}}, {"limit", {"5000"}}});
+	CHECK_EQ(all.size(), (size_t)5);
+	std::map<std::string, json> by_rule;
+	for (auto &a : all)
+		by_rule[a["rule"].get<std::string>() + "@" + a["host"].get<std::string>()] = a;
+	CHECK(by_rule["CRED-001@web-1"]["id"].get<std::string>().rfind("R", 0) == 0);  // derived, stable id
+	CHECK_EQ(by_rule["CRED-001@web-1"]["pid"], 4242);
+	CHECK_EQ(by_rule["EXEC-004@web-1"]["id"], "A1772359300-2");
+	CHECK_EQ(by_rule["EXEC-004@web-1"]["status"], "resolved");
+	CHECK_EQ(by_rule["EXEC-004@web-1"]["note"], "pentest, ticket SEC-12");
+	CHECK_EQ(by_rule["EXEC-004@web-1"]["triaged_by"], "olive");
+	CHECK_EQ(by_rule["CRED-001@web-2"]["status"], "acknowledged");
+	CHECK_EQ(by_rule["CRED-001@web-2"]["triaged_by"], "Olive Ortega");
+	CHECK_EQ(by_rule["HOST-ID-MISMATCH@db-1"]["actor"], "console");
+	CHECK_EQ(by_rule["VAULT-ACCESS@console"]["title"], "Secret 'db/pw' accessed by olive");
+	// inventory: current state and history
+	auto det = st.host_detail("web-1");
+	CHECK(det && (*det)["inventory"].size() == 1 && (*det)["inventory"][0]["name"] == "lodash");
+	CHECK_EQ(st.inventory_json("web-1").size(), (size_t)3);
+	// rollouts, oldest first here: Go's (no id), a complete one, an interrupted one
+	auto ro = st.rollouts_json();  // newest first
+	CHECK_EQ(ro.size(), (size_t)3);
+	if (ro.size() == 3) {
+		CHECK(ro[0]["id"] == "RO1772409606-2" && ro[0]["status"] == "interrupted" && ro[0]["cohort"].size() == 1);
+		CHECK(ro[1]["id"] == "RO1772409605-1" && ro[1]["status"] == "complete" && ro[1]["delivered"][0] == "web-2");
+		CHECK(!ro[2].contains("id") && ro[2]["by"] == "dee" && ro[2]["failed"][0] == "db-1" && ro[2]["percent"] == 100);
+	}
+	// analysis records
+	auto sg = an.suggestion("S1772409607-1");
+	CHECK(sg && sg->status == "accepted" && sg->decided_by == "Olive Ortega" && sg->kind == "close_stale" &&
+	      sg->source == "engine" && sg->action["type"] == "manual");
+	auto ai = an.ai_for("rule:CRED-001");
+	CHECK(ai && (*ai)["result"]["verdict"] == "tune");
+	// audit record: searchable, no host
+	auto au = st.search_events({{"type", {"audit"}}});
+	CHECK(au.size() == 1 && au[0]["op"] == "policy_push" && au[0]["by"] == "Olive Ortega");
+	st.close_journal();
+}
+
 int main() {
 	signal(SIGPIPE, SIG_IGN);  // as run() does: a peer closing early must not kill the process
+	// WISP_TEST=<substring>: run only the matching tests.
+	const char *only = getenv("WISP_TEST");
+	size_t ran = 0;
 	for (auto &t : registry()) {
+		if (only && *only && !strstr(t.name, only))
+			continue;
+		ran++;
 		current = t.name;
 		int before = failures;
 		try {
@@ -1761,6 +2394,6 @@ int main() {
 		}
 		printf("%s %s\n", failures == before ? "--- PASS:" : "--- FAIL:", t.name);
 	}
-	printf("%s (%zu tests, %d failed checks)\n", failures ? "FAIL" : "ok", registry().size(), failures);
+	printf("%s (%zu tests, %d failed checks)\n", failures ? "FAIL" : "ok", ran, failures);
 	return failures ? 1 : 0;
 }

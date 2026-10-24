@@ -1,0 +1,13 @@
+{"ts":"2026-03-02T00:00:00.000Z","type":"journal","src":"console","format":2,"version":"1.1.0"}
+{"ts":"2026-03-02T00:00:01Z","type":"hello","host":"web-2","group":"prod","version":"1.1.0","host_id":"tpm-web-2","trust":"tpm","rx_ts":"2026-03-02T00:00:01.120Z"}
+{"id":"A1772409602-1","ts":"2026-03-02T00:00:02Z","type":"alert","host":"web-2","group":"prod","rule":"CRED-001","title":"Credential file read","severity":"high","action":"alert","actor":"ai","actor_src":"claude-code","cmd":"cat .env","status":"open","rx_ts":"2026-03-02T00:00:02.050Z"}
+{"ts":"2026-03-02T00:00:03.000Z","type":"triage","id":"A1772409602-1","host":"web-2","group":"","rule":"CRED-001","status":"acknowledged","note":"looking","by":"Olive Ortega","src":"console"}
+{"ts":"2026-03-02T00:00:04Z","type":"inventory","host":"web-1","group":"prod","kind":"pip","name":"requests","version":"2.0.0","where":"/usr/lib/python3/dist-packages","change":"removed","rx_ts":"2026-03-02T00:00:04.000Z"}
+{"ts":"2026-03-02T00:00:05.000Z","type":"rollout_intent","host":"","group":"prod","action":"monitor","percent":50,"cohort":["web-2"],"by":"dee","id":"RO1772409605-1","src":"console"}
+{"ts":"2026-03-02T00:00:05.000Z","type":"rollout","host":"","group":"prod","action":"monitor","percent":50,"cohort":["web-2"],"delivered":["web-2"],"by":"dee","id":"RO1772409605-1","src":"console"}
+{"ts":"2026-03-02T00:00:06.000Z","type":"rollout_intent","host":"","group":"prod","action":"enforce","percent":10,"cohort":["web-1"],"by":"dee","id":"RO1772409606-2","src":"console"}
+{"ts":"2026-03-02T00:00:07.000Z","type":"suggestion","id":"S1772409607-1","kind":"close_stale","title":"Close 1 stale alert","rationale":"open for 30 days","severity":"low","source":"engine","key":"close_stale:web-1","action":{"type":"manual","instructions":"close it"},"evidence":["A1772359300-2"],"src":"console"}
+{"ts":"2026-03-02T00:00:08.000Z","type":"suggestion_decision","id":"S1772409607-1","status":"accepted","by":"Olive Ortega","result":"recorded","src":"console"}
+{"ts":"2026-03-02T00:00:09.000Z","type":"ai_result","purpose":"curate","by":"Olive Ortega","job":"J1","target":"rule:CRED-001","result":{"verdict":"tune","confidence":"high","summary":"noisy on dev hosts"},"src":"console"}
+{"ts":"2026-03-02T00:00:10.000Z","type":"audit","host":"console","op":"policy_push","target":"web-2","command":"enforce","delivered":true,"by":"Olive Ortega","src":"console"}
+{"ts":"2026-03-02T00:00:11.000Z","type":"lifecycle","host":"web-2","group":"prod","change":"disconnected","reason":"console shutdown","src":"console"}

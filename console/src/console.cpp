@@ -60,6 +60,15 @@ static const FlagDef FLAGS[] = {
     {"events", "events.jsonl", "event journal (append-only JSONL, replayed at start)", false},
     {"journal-max-mb", "256", "rotate the journal past this size (one previous segment kept; 0: never rotate)", false},
     {"max-sensors", "16384", "most concurrent sensor connections (each holds a thread; keep TasksMax above this)", false},
+    {"max-hosts", "100000", "most hosts (not retired) the console tracks; hellos for new hosts past it are refused", false},
+    {"max-hosts-per-cert", "0",
+     "most hosts one sensor client certificate may speak for (0: no limit; set it when every sensor has its own "
+     "certificate)",
+     false},
+    {"http-local-proxy", "false",
+     "a reverse proxy on this machine carries every user: exempt loopback clients from the per-client HTTP "
+     "connection limit (never trusts X-Forwarded-For)",
+     true},
     {"stale-after", "3m0s", "mark a host stale after this long without contact", false},
     {"decommission-after", "168h0m0s", "retire a silent persistent host after this long (0: never)", false},
     {"slack", "", "Slack webhook for high/critical alerts (default $WISP_SLACK_WEBHOOK)", false},
@@ -194,6 +203,9 @@ static void parse_flags_or_throw(int argc, char **argv, Config &c, std::ostream 
 	};
 	c.journal_max_mb = integer("journal-max-mb", 0, 1 << 20, "an integer number of MiB from 0 (never rotate) to 1048576");
 	c.max_sensors = integer("max-sensors", 1, 1000000, "an integer from 1 to 1000000");
+	c.max_hosts = integer("max-hosts", 1, 10000000, "an integer from 1 to 10000000");
+	c.max_hosts_per_cert = integer("max-hosts-per-cert", 0, 10000000, "an integer from 0 (no limit) to 10000000");
+	c.http_proxy_local = v["http-local-proxy"] == "true";
 	auto dur = [&](const char *k) {
 		auto d = parse_duration(v[k]);
 		if (!d) {
@@ -309,11 +321,11 @@ static std::string printable(const std::string &s, size_t max = 512) {
 static void audit(Store &st, json rec) {
 	rec["type"] = "audit";
 	rec["host"] = "console";  // never a fleet host: replay leaves no trace in host state
+	std::string op = rec.value("op", "?");
 	try {
-		// Round-trip with replacement so a non-UTF-8 name can never make the record unwritable.
-		st.record_console(json::parse(rec.dump(-1, ' ', false, json::error_handler_t::replace)));
+		st.record_console(std::move(rec));  // dumped with U+FFFD for any non-UTF-8 text
 	} catch (const std::exception &e) {
-		logf("audit: could not journal %s: %s", rec.value("op", "?").c_str(), e.what());
+		logf("audit: could not journal %s: %s", op.c_str(), e.what());
 	}
 }
 
@@ -420,7 +432,22 @@ static void route(App &app, const Request &req, Response &r) {
 	if (p == "/api/summary") {
 		if (!get_only("viewer"))
 			return;
-		return write_json(r, st.summary());
+		json sum = st.summary();
+		if (app.analyst) {
+			// Every incident not resolved (open or acknowledged, as the
+			// Incidents page lists them), uncapped, by priority.
+			json by = {{"P1", 0}, {"P2", 0}, {"P3", 0}, {"P4", 0}};
+			int total = 0;
+			for (auto &inc : app.analyst->incidents()) {
+				if (inc.status == "resolved")
+					continue;
+				total++;
+				if (by.contains(inc.priority))
+					by[inc.priority] = by[inc.priority].get<int>() + 1;
+			}
+			sum["incidents_open"] = {{"total", total}, {"by_priority", by}};
+		}
+		return write_json(r, sum);
 	}
 	if (p == "/api/hosts") {
 		if (!get_only("viewer"))
@@ -579,6 +606,21 @@ static std::string jfield(const json &j, const char *k) {
 	return it != j.end() && it->is_string() ? it->get<std::string>() : std::string();
 }
 
+// The role needed to approve or reject a suggestion: what its action stands
+// in for (analysis required_role(): deployer for a rollout, else operator),
+// and never less than operator for one the AI assistant proposed. AI text is
+// shaped by telemetry an attacker can write (prompt injection), so a
+// deployer-level automation token -- enough for a rollout the engine
+// proposed -- can never approve an AI-proposed rollout on the model's word.
+// This route is where that is decided (Analyst::decide checks only the
+// action's role, which this never falls below).
+std::string decide_role(const Suggestion &s) {
+	std::string need = required_role(s.action);
+	if (s.source == "ai" && role_rank(need) < role_rank("operator"))
+		need = "operator";
+	return need;
+}
+
 // Incidents, fleet health, rule review, suggestions and the AI assistant.
 // Returns false when the path is not one of these.
 static bool route_analysis(App &app, const Request &req, Response &r) {
@@ -639,11 +681,21 @@ static bool route_analysis(App &app, const Request &req, Response &r) {
 		return true;
 	}
 	if (p == "/api/suggestions") {
-		if (need("GET", "viewer"))
-			write_json(r, an.suggestions_json(qfirst(req, "status")));
+		if (!need("GET", "viewer"))
+			return true;
+		// can_approve: whether the caller's role may decide it (decide_role),
+		// whatever its status, so the UI offers only what the route accepts.
+		json list = an.suggestions_json(qfirst(req, "status"));
+		for (auto &j : list) {
+			auto sg = j.contains("id") && j["id"].is_string() ? an.suggestion(j["id"].get<std::string>()) : std::nullopt;
+			j["can_approve"] = sg.has_value() && role_rank(role) >= role_rank(decide_role(*sg));
+		}
+		write_json(r, list);
 		return true;
 	}
 	if (p == "/api/suggestions/decide") {
+		// The lowest role any suggestion needs; the suggestion itself decides
+		// the rest (below).
 		if (!need("POST", "deployer"))
 			return true;
 		json b = body_json(req);
@@ -651,6 +703,13 @@ static bool route_analysis(App &app, const Request &req, Response &r) {
 		if (d != "approve" && d != "reject") {
 			write_err(r, 400, "body must be JSON {id, decision: approve|reject, note}");
 			return true;
+		}
+		if (auto sg = an.suggestion(jfield(b, "id"))) {
+			std::string min = decide_role(*sg);
+			if (role_rank(role) < role_rank(min)) {
+				write_err(r, 403, "this suggestion needs the " + min + " role");
+				return true;
+			}
 		}
 		try {
 			Suggestion s = an.decide(jfield(b, "id"), d == "approve", user, role, jfield(b, "note"));
@@ -666,7 +725,7 @@ static bool route_analysis(App &app, const Request &req, Response &r) {
 	if (p == "/api/ai/status") {
 		if (!need("GET", "viewer"))
 			return true;
-		write_json(r, app.ai ? app.ai->status_json() : json{{"enabled", false}, {"reason", "disabled with -ai=false"}});
+		write_json(r, app.ai ? app.ai->status_json() : json{{"enabled", false}, {"reason", app.ai_off}});
 		return true;
 	}
 	if (p == "/api/ai/jobs") {
@@ -685,7 +744,7 @@ static bool route_analysis(App &app, const Request &req, Response &r) {
 		if (!need("POST", "operator"))
 			return true;
 		if (!app.ai) {
-			write_err(r, 503, "the AI assistant is disabled (-ai=false)");
+			write_err(r, 503, "the AI assistant is unavailable: " + app.ai_off);
 			return true;
 		}
 		json b = body_json(req);
@@ -709,20 +768,8 @@ void handle(Store &st, const Request &req, Response &r) {
 	handle(app, req, r);
 }
 
-static void security_headers(const Request &req, Response &r) {
-	r.set("Content-Security-Policy",
-	      "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; "
-	      "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'");
-	r.set("X-Content-Type-Options", "nosniff");
-	r.set("X-Frame-Options", "DENY");
-	r.set("Referrer-Policy", "no-referrer");
-	r.set("Cross-Origin-Opener-Policy", "same-origin");
-	if (req.tls)
-		r.set("Strict-Transport-Security", "max-age=31536000");
-}
-
 void handle(App &app, const Request &req, Response &r) {
-	security_headers(req, r);
+	security_headers(r, req.tls);
 	auto t0 = steady_clock::now();
 	route(app, req, r);
 	// Access log: every change, every refusal, and every vault request
@@ -764,16 +811,16 @@ namespace {
 // using. Half-open links (a laptop that slept, a partition) are dropped by
 // TCP keepalive and TCP_USER_TIMEOUT within about two minutes, before the
 // host shows as stale (tune_sensor_socket); a link whose sensor has sent
-// nothing for longer than the stale window, and never less than two of
-// wispd's longest heartbeat intervals (2 x 120 s), is reported as not
-// delivered: its process is hung or gone, and the bytes would only reach the
-// socket buffer. A write that fails or times out ends the connection
+// nothing for longer than -stale-after -- exactly when the Hosts page turns
+// it Stale -- is reported as not delivered: its process is hung or gone, and
+// the bytes would only reach the socket buffer. (The store refuses pushes to
+// a stale host too, on the same clock.) A write that fails or times out ends the connection
 // (Stream::write_all), so the sensor reconnects and nothing half-written can
 // be mistaken for a later command.
 class SensorConn : public SensorLink {
 public:
 	SensorConn(std::shared_ptr<Stream> s, nanoseconds stale)
-	    : s_(std::move(s)), silent_limit_(std::max<nanoseconds>(stale, minutes(4)).count()) {
+	    : s_(std::move(s)), silent_limit_(stale.count()) {
 		touch();
 	}
 	bool send(const std::string &line) override {
@@ -936,6 +983,10 @@ void IngestServer::connection(int fd) {
 	}
 	auto conn = std::make_shared<SensorConn>(stream, st.stale_after);
 	SensorSession session{"", conn};
+	// The session speaks with the client certificate's identity: the store
+	// records it per host and never hands a host's control lines to a
+	// connection that authenticated with a different certificate.
+	stream->peer_cert(&session.cert_fp, &session.cert_name);
 	struct Closed {  // on every exit path, exceptions included: the store must forget this link
 		Store &st;
 		SensorSession &s;
@@ -1180,6 +1231,16 @@ private:
 
 // ---- run ------------------------------------------------------------------------
 
+bool read_ai_key_file(const std::string &path, std::string *key, std::string *why) {
+	auto k = read_file(path);
+	if (!k || trim(*k).empty()) {
+		*why = "-ai-key-file " + path + " is unreadable or empty; the AI assistant is unavailable";
+		return false;
+	}
+	*key = trim(*k);
+	return true;
+}
+
 static void reload_roles(Store &st, const Config &c) {
 	if (c.roles.empty()) {
 		logf("SIGHUP: no -roles file to reload (-dev without -roles: authentication stays off)");
@@ -1241,6 +1302,8 @@ int run(const Config &c) {
 		st.stale_after = c.stale_after;
 		st.decom_after = c.decom_after;
 		st.journal_max = (long long)c.journal_max_mb << 20;
+		st.max_hosts = (size_t)c.max_hosts;
+		st.max_hosts_per_cert = (size_t)c.max_hosts_per_cert;
 		st.vulndb = VulnDB::load(c.vulndb);
 		if (c.roles.empty() && !c.dev)
 			throw std::runtime_error(
@@ -1261,17 +1324,21 @@ int run(const Config &c) {
 		st.replay_hook = [&analyst](const json &rec) { analyst.replay(rec); };
 		st.open_journal(c.in_state(c.journal));
 		std::unique_ptr<Assistant> assistant;
-		if (c.ai) {
+		std::string ai_off = "disabled with -ai=false";
+		bool ai_on = c.ai;
+		AiConfig ac;
+		if (ai_on && !c.ai_key_file.empty()) {
+			// An optional feature must not keep the console (and the fleet's
+			// telemetry) down: an unusable key file only turns the assistant off.
+			if (!read_ai_key_file(c.ai_key_file, &ac.api_key, &ai_off)) {
+				logf("ERROR: %s (fix the file and restart the console)", ai_off.c_str());
+				ai_on = false;
+			}
+		}
+		if (ai_on) {
 			// Key order (as documented): -ai-key-file, else the vault secret
 			// anthropic/api-key (read on every request, so a rotation there
 			// takes effect at once), else $ANTHROPIC_API_KEY.
-			AiConfig ac;
-			if (!c.ai_key_file.empty()) {
-				auto k = read_file(c.ai_key_file);
-				if (!k || trim(*k).empty())
-					throw std::runtime_error("-ai-key-file " + c.ai_key_file + ": unreadable or empty");
-				ac.api_key = trim(*k);
-			}
 			if (const char *k = getenv("ANTHROPIC_API_KEY"); k && *k)
 				ac.env_key = trim(k);
 			ac.base_url = c.ai_url;
@@ -1284,7 +1351,7 @@ int run(const Config &c) {
 			logf("AI assistant: %s (model %s)",
 			     assistant->configured() ? "enabled" : "off until an API key is configured", c.ai_model.c_str());
 		}
-		App app{st, &analyst, assistant.get()};
+		App app{st, &analyst, assistant.get(), ai_off};
 		std::unique_ptr<SlackNotifier> slack;
 		if (!c.slack.empty()) {
 			slack = std::make_unique<SlackNotifier>(c.slack);
@@ -1299,6 +1366,7 @@ int run(const Config &c) {
 		auto http_ln = std::make_unique<Listener>(c.http_addr);
 		HttpServer srv([&app](const Request &rq, Response &rs) { handle(app, rq, rs); }, http_ctx.get());
 		srv.precheck = [&app](const Request &rq, Response &rs) { return precheck(app, rq, rs); };
+		srv.exempt_loopback = c.http_proxy_local;
 
 		IngestServer ing(st, ingest_ctx.get(), c.max_sensors);
 		std::mutex stop_mu;

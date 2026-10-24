@@ -1,0 +1,13 @@
+{"ts":"2026-03-01T10:00:00Z","type":"hello","host":"web-1","group":"prod","version":"1.0.0","host_id":"tpm-web-1","trust":"tpm"}
+{"ts":"2026-03-01T10:00:01Z","type":"hello","host":"ci-7","group":"ci","version":"1.0.0","host_id":"gen-ci-7","trust":"generated","ephemeral":true}
+{"ts":"2026-03-01T10:00:02Z","type":"hello","host":"db-1","group":"prod","version":"0.9.0","host_id":"dmi-db-1","trust":"dmi"}
+{"ts":"2026-03-01T10:01:00Z","type":"alert","host":"web-1","group":"prod","rule":"CRED-001","mitre":"T1552","title":"Credential file read","severity":"high","action":"alert","actor":"human","actor_src":"tty","pid":4242,"ppid":1,"uid":1000,"comm":"cat","exe":"/usr/bin/cat","cmd":"cat /home/u/.aws/credentials"}
+{"id":"A1772359300-2","ts":"2026-03-01T10:01:40Z","type":"alert","host":"web-1","group":"prod","rule":"EXEC-004","title":"Shell from web server","severity":"critical","action":"kill","actor":"service","comm":"sh","exe":"/bin/sh","cmd":"sh -c id","status":"open"}
+{"ts":"2026-03-01T10:02:00Z","type":"triage","id":"A1772359300-2","host":"web-1","rule":"EXEC-004","status":"resolved","note":"pentest, ticket SEC-12","by":"olive"}
+{"ts":"2026-03-01T10:03:00Z","type":"inventory","host":"web-1","group":"prod","kind":"npm","name":"lodash","version":"4.17.20","where":"/srv/app/node_modules/lodash","change":"present"}
+{"ts":"2026-03-01T10:03:01Z","type":"inventory","host":"web-1","group":"prod","kind":"pip","name":"requests","version":"2.0.0","where":"/usr/lib/python3/dist-packages","change":"present"}
+{"ts":"2026-03-01T10:04:00Z","type":"rollout","host":"","group":"prod","action":"enforce","percent":100,"cohort":["db-1","web-1"],"delivered":["web-1"],"failed":["db-1"],"by":"dee"}
+{"ts":"2026-03-01T10:05:00Z","type":"alert","host":"db-1","group":"prod","rule":"HOST-ID-MISMATCH","title":"Host identity changed","severity":"high","action":"alert","actor":"console","cmd":"a sensor presented a different host identity for an existing hostname","id":"A1772359500-3","status":"open"}
+{"ts":"2026-03-01T10:06:00Z","type":"alert","host":"console","group":"","rule":"VAULT-ACCESS","title":"Secret 'db/pw' accessed by olive","severity":"info","action":"alert","actor":"console","cmd":"vault get db/pw","id":"A1772359560-4","status":"open"}
+{"ts":"2026-03-01T10:07:00Z","type":"bye","host":"ci-7","group":"ci","reason":"ephemeral-exit"}
+{"ts":"2026-03-01T10:07:01Z","type":"lifecycle","host":"ci-7","group":"ci","change":"decommissioned","reason":"ephemeral-exit"}
